@@ -1,0 +1,683 @@
+#!/usr/bin/env bats
+# Schema-validation bats for the 6 schemas that had no runtime check.
+# Ensures producers emit output that satisfies its own schema, so the
+# schema contract catches drift the moment a bin script starts emitting
+# fields outside its `properties` or missing a field in `required[]`.
+#
+# Schemas covered here:
+#   - action-plan.schema.json        (skill-layer composed; we synthesize a minimal valid one)
+#   - documentation-plan.schema.json (produced by bin/route-docs.sh)
+#   - drift-report.schema.json       (produced by bin/compute-drift.sh)
+#   - mcp-doc-targets.schema.json    (produced by bin/detect-mcp-docs.sh)
+#   - link-check-report.schema.json  (produced by bin/check-links.sh)
+#   - orphan-report.schema.json      (produced by bin/find-orphans.sh)
+#
+# Already runtime-validated elsewhere:
+#   - stack-descriptor.schema.json  → tests/bats/test-detect.bats
+#   - branching-choice.schema.json  → tests/bats/test-recommend.bats
+#   - config.schema.json            → tests/bats/test-sync-team.bats
+
+setup() {
+  REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/../.." && pwd)"
+  TMP="$(mktemp -d -t nyann-schema.XXXXXX)"
+  TMP="$(cd "$TMP" && pwd -P)"
+  REPO="$TMP/repo"
+  mkdir -p "$REPO"
+  ( cd "$REPO" && git init -q -b main \
+      && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m seed )
+
+  if ! command -v uvx >/dev/null 2>&1 && ! command -v check-jsonschema >/dev/null 2>&1; then
+    skip "no schema validator (install check-jsonschema or uvx)"
+  fi
+  if command -v check-jsonschema >/dev/null 2>&1; then
+    VALIDATE=(check-jsonschema)
+  else
+    VALIDATE=(uvx --quiet check-jsonschema)
+  fi
+}
+
+teardown() { rm -rf "$TMP"; }
+
+validate_stdout_against() {
+  local schema="$1"; shift
+  # Capture stderr + exit code so a producer regression that writes a
+  # partial-but-valid prefix before crashing can't pass silently.
+  local producer_status
+  if "$@" > "$TMP/out.json" 2> "$TMP/err.txt"; then
+    producer_status=0
+  else
+    producer_status=$?
+  fi
+  if (( producer_status != 0 )); then
+    echo "producer exited $producer_status; stderr:" >&2
+    cat "$TMP/err.txt" >&2
+    return 1
+  fi
+  [[ -s "$TMP/out.json" ]] || { echo "producer emitted nothing; stderr:" >&2; cat "$TMP/err.txt" >&2; return 1; }
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/$schema" "$TMP/out.json"
+}
+
+# --- DocumentationPlan (route-docs.sh) --------------------------------------
+
+@test "documentation-plan schema: route-docs output validates (default profile)" {
+  validate_stdout_against documentation-plan.schema.json \
+    bash "${REPO_ROOT}/bin/route-docs.sh" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+@test "documentation-plan schema: route-docs output validates (nextjs-prototype)" {
+  validate_stdout_against documentation-plan.schema.json \
+    bash "${REPO_ROOT}/bin/route-docs.sh" --profile "${REPO_ROOT}/profiles/nextjs-prototype.json"
+}
+
+# --- DriftReport (compute-drift.sh) -----------------------------------------
+
+@test "drift-report schema: compute-drift output validates" {
+  validate_stdout_against drift-report.schema.json \
+    bash "${REPO_ROOT}/bin/compute-drift.sh" \
+      --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+# --- DriftNarrative (explain-diff.sh --format json) -------------------------
+# Producer takes a DriftReport on stdin. We chain compute-drift into
+# explain-diff so a regression on either side surfaces here, not just
+# in the standalone test fixtures of test-explain-diff.bats.
+
+@test "drift-narrative schema: explain-diff --format json output validates" {
+  bash "${REPO_ROOT}/bin/compute-drift.sh" \
+    --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json" \
+    > "$TMP/drift.json"
+  validate_stdout_against drift-narrative.schema.json \
+    bash "${REPO_ROOT}/bin/explain-diff.sh" \
+      --file "$TMP/drift.json" --format json --with-health 80 --with-trend -3
+}
+
+# --- DependencyUpdaterConfig (gen-dependency-updater.sh input contract) -----
+# The schema is the *input* contract — gen-dependency-updater.sh accepts
+# CLI flags rather than a JSON payload, so we validate a hand-rolled
+# fixture against the schema (the rendered Dependabot YAML / Renovate
+# JSON have their own first-party schemas owned by GitHub / Mend, not
+# nyann). This lock catches schema drift from a future CLI flag whose
+# enum diverges from the schema's allowlist.
+
+@test "dependency-updater-config schema: minimal hand-rolled config validates" {
+  cat > "$TMP/dep-config.json" <<'EOF'
+{
+  "updater": "dependabot",
+  "ecosystems": [
+    { "ecosystem": "npm", "directory": "/" },
+    { "ecosystem": "github-actions", "directory": "/", "schedule_interval": "weekly", "grouping": "minor-patch", "open_pull_requests_limit": 5 }
+  ],
+  "snapshot_version": "1.10.0"
+}
+EOF
+  "${VALIDATE[@]}" \
+    --schemafile "${REPO_ROOT}/schemas/dependency-updater-config.schema.json" \
+    "$TMP/dep-config.json"
+}
+
+@test "dependency-updater-config schema: rejects unknown ecosystem" {
+  cat > "$TMP/dep-config.json" <<'EOF'
+{
+  "updater": "dependabot",
+  "ecosystems": [
+    { "ecosystem": "haskell", "directory": "/" }
+  ]
+}
+EOF
+  ! "${VALIDATE[@]}" \
+    --schemafile "${REPO_ROOT}/schemas/dependency-updater-config.schema.json" \
+    "$TMP/dep-config.json"
+}
+
+# --- DevcontainerConfig (gen-devcontainer.sh input contract) ---------------
+# Like the dependency-updater contract, the schema describes the *input*
+# shape — the script accepts CLI flags rather than a JSON payload.
+# These tests pin the enum / required-field surface so a future CLI
+# flag that drops out of the schema's allowlist surfaces here.
+
+@test "devcontainer-config schema: minimal hand-rolled config validates" {
+  cat > "$TMP/dc-config.json" <<'EOF'
+{
+  "language": "python",
+  "name": "test-app",
+  "forwarded_ports": [8000, 8080],
+  "host_requirements": { "cpus": 4, "memory": "8gb" },
+  "additional_extensions": ["ms-azuretools.vscode-docker"],
+  "snapshot_version": "1.10.0"
+}
+EOF
+  "${VALIDATE[@]}" \
+    --schemafile "${REPO_ROOT}/schemas/devcontainer-config.schema.json" \
+    "$TMP/dc-config.json"
+}
+
+@test "devcontainer-config schema: rejects unknown language" {
+  cat > "$TMP/dc-config.json" <<'EOF'
+{ "language": "fortran" }
+EOF
+  ! "${VALIDATE[@]}" \
+    --schemafile "${REPO_ROOT}/schemas/devcontainer-config.schema.json" \
+    "$TMP/dc-config.json"
+}
+
+@test "devcontainer-config schema: rejects malformed extension id" {
+  cat > "$TMP/dc-config.json" <<'EOF'
+{
+  "language": "node",
+  "additional_extensions": ["not-a-publisher-format"]
+}
+EOF
+  ! "${VALIDATE[@]}" \
+    --schemafile "${REPO_ROOT}/schemas/devcontainer-config.schema.json" \
+    "$TMP/dc-config.json"
+}
+
+# --- MCPDocTargets (detect-mcp-docs.sh) -------------------------------------
+
+@test "mcp-doc-targets schema: detect-mcp-docs output validates (no settings)" {
+  # detect-mcp-docs reads Claude Code settings.json; point it at a
+  # fresh (nonexistent) path so the script emits the "no settings"
+  # shape.
+  validate_stdout_against mcp-doc-targets.schema.json \
+    bash "${REPO_ROOT}/bin/detect-mcp-docs.sh" \
+      --settings-path "$TMP/no-such-settings.json"
+}
+
+# --- LinkCheckReport (check-links.sh) ---------------------------------------
+
+@test "link-check-report schema: check-links output validates (empty repo)" {
+  validate_stdout_against link-check-report.schema.json \
+    bash "${REPO_ROOT}/bin/check-links.sh" --target "$REPO"
+}
+
+# --- OrphanReport (find-orphans.sh) -----------------------------------------
+
+@test "orphan-report schema: find-orphans output validates" {
+  validate_stdout_against orphan-report.schema.json \
+    bash "${REPO_ROOT}/bin/find-orphans.sh" --target "$REPO"
+}
+
+# --- ActionPlan (no direct producer; validate a hand-rolled minimal plan) ---
+
+@test "action-plan schema: minimal hand-rolled plan validates" {
+  cat > "$TMP/plan.json" <<'JSON'
+{"writes":[{"path":"CLAUDE.md","action":"create","bytes":0}],"commands":[],"remote":[]}
+JSON
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/action-plan.schema.json" "$TMP/plan.json"
+}
+
+@test "action-plan schema: rejects an absolute path in writes[]" {
+  cat > "$TMP/plan.json" <<'JSON'
+{"writes":[{"path":"/etc/passwd","action":"delete"}],"commands":[],"remote":[]}
+JSON
+  # The schema may accept absolute paths (it's a string), so we're
+  # mostly verifying the schema doesn't reject structurally valid JSON.
+  # The runtime `nyann::assert_path_under_target` in bootstrap.sh is
+  # what actually blocks — that's a separate test-bootstrap case.
+  run "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/action-plan.schema.json" "$TMP/plan.json"
+  # We don't assert pass or fail here — just that the validator runs
+  # without crashing. The real enforcement is runtime: bootstrap
+  # rejects out-of-target paths via nyann::assert_path_under_target.
+  [ "$status" -le 1 ]
+}
+
+# --- CommitResult (try-commit.sh) -------------------------------------------
+
+@test "commit-result schema: try-commit on empty staging emits error result" {
+  ( cd "$REPO" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed" )
+  # Nothing staged → try-commit refuses with an error-shaped JSON.
+  validate_stdout_against commit-result.schema.json \
+    bash "${REPO_ROOT}/bin/try-commit.sh" --target "$REPO" --subject "feat: bats schema check"
+}
+
+# --- SyncResult (sync.sh) ---------------------------------------------------
+
+@test "sync-result schema: clean up-to-date branch emits SyncResult" {
+  # Up-to-date branch exits 0 with valid SyncResult JSON. The dirty-tree
+  # path also emits valid JSON but exits 1 (validate_stdout_against
+  # treats non-zero as producer failure).
+  ( cd "$REPO"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed"
+    git checkout -q -b feat/x
+  )
+  validate_stdout_against sync-result.schema.json \
+    bash "${REPO_ROOT}/bin/sync.sh" --target "$REPO" --dry-run
+}
+
+# --- UndoResult (undo.sh) ---------------------------------------------------
+
+@test "undo-result schema: undo --dry-run emits preview shape" {
+  ( cd "$REPO"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed"
+    git checkout -q -b feat/x
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "feat: a"
+  )
+  validate_stdout_against undo-result.schema.json \
+    bash "${REPO_ROOT}/bin/undo.sh" --target "$REPO" --dry-run
+}
+
+@test "undo-result schema: undo on main emits refused shape" {
+  ( cd "$REPO" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed" )
+  # undo.sh exits 1 with refused JSON when on main.
+  out=$(bash "${REPO_ROOT}/bin/undo.sh" --target "$REPO" 2>/dev/null || true)
+  echo "$out" > "$TMP/out.json"
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/undo-result.schema.json" "$TMP/out.json"
+}
+
+# --- PrResult (pr.sh) -------------------------------------------------------
+
+@test "pr-result schema: --context-only emits PrContext shape" {
+  ( cd "$REPO"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed"
+    git checkout -q -b feat/x
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "feat: a"
+  )
+  validate_stdout_against pr-result.schema.json \
+    bash "${REPO_ROOT}/bin/pr.sh" --target "$REPO" --context-only
+}
+
+# --- ReleaseResult (release.sh) ---------------------------------------------
+
+@test "release-result schema: changesets strategy emits skipped shape" {
+  ( cd "$REPO" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed" )
+  validate_stdout_against release-result.schema.json \
+    bash "${REPO_ROOT}/bin/release.sh" --target "$REPO" --version 1.2.3 --strategy changesets
+}
+
+# --- CommitContext (commit.sh) ----------------------------------------------
+
+@test "commit-context schema: commit.sh emits CommitContext when changes are staged" {
+  ( cd "$REPO"
+    git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "chore: seed"
+    git checkout -q -b feat/x
+    echo "x" > a.txt
+    git add a.txt
+  )
+  validate_stdout_against commit-context.schema.json \
+    bash "${REPO_ROOT}/bin/commit.sh" --target "$REPO"
+}
+
+# --- PrereqsReport (check-prereqs.sh) ---------------------------------------
+
+@test "prereqs-report schema: check-prereqs --json validates" {
+  validate_stdout_against prereqs-report.schema.json \
+    bash "${REPO_ROOT}/bin/check-prereqs.sh" --json
+}
+
+# --- StateSummary (explain-state.sh) ----------------------------------------
+
+@test "state-summary schema: explain-state --json on bare repo validates" {
+  validate_stdout_against state-summary.schema.json \
+    bash "${REPO_ROOT}/bin/explain-state.sh" --target "$REPO" --json
+}
+
+# --- TeamDriftReport (check-team-drift.sh) ----------------------------------
+
+@test "team-drift-report schema: empty config emits empty arrays shape" {
+  # No config.json present → drift checker emits the empty-shape JSON
+  # (drift:[], up_to_date:[], unreachable:[]).
+  fake_home="$TMP/home"
+  mkdir -p "$fake_home/.claude/nyann"
+  validate_stdout_against team-drift-report.schema.json \
+    env HOME="$fake_home" bash "${REPO_ROOT}/bin/check-team-drift.sh" --offline --user-root "$fake_home/.claude/nyann"
+}
+
+# --- TeamSyncResult (sync-team-profiles.sh) ---------------------------------
+
+@test "team-sync-result schema: empty config emits empty arrays shape" {
+  fake_home="$TMP/home"
+  mkdir -p "$fake_home/.claude/nyann"
+  validate_stdout_against team-sync-result.schema.json \
+    env HOME="$fake_home" bash "${REPO_ROOT}/bin/sync-team-profiles.sh" --user-root "$fake_home/.claude/nyann"
+}
+
+@test "team-sync-result schema: --check-updates shape with updates_available validates" {
+  # The --check-updates path adds a top-level updates_available[] array of
+  # team-profile-changelog elements when a pinned source is behind. Rather
+  # than stand up a real behind-by-N pinned remote, synthesize an object of
+  # the exact shape sync-team-profiles.sh emits (see the jq at
+  # bin/sync-team-profiles.sh:412-419 and the changelog item builder at
+  # :196-204) and confirm it validates — i.e. the schema no longer rejects
+  # the field via additionalProperties:false.
+  cat > "$TMP/out.json" <<'JSON'
+{
+  "synced": [],
+  "skipped": [],
+  "registered": [],
+  "invalid": [],
+  "updates_available": [
+    {
+      "source_name": "acme",
+      "pinned_at": "v1.0.0",
+      "latest": "v1.2.0",
+      "commits_behind": 3,
+      "changed_profiles": ["profiles/backend.json"],
+      "commit_log": [
+        { "sha": "abc1234", "subject": "feat: add backend profile" },
+        { "sha": "def5678", "subject": "fix: tighten hook" }
+      ]
+    }
+  ]
+}
+JSON
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/team-sync-result.schema.json" "$TMP/out.json"
+}
+
+# --- DerivedCodeowners (derive-codeowners.sh) -------------------------------
+
+@test "derived-codeowners schema: derive-codeowners output validates" {
+  # Build a couple of authored commits per top-level dir so the script
+  # crosses its --min-commits threshold and emits a non-empty array. The
+  # noreply-github email derives an @handle owner; the plain email derives
+  # an email owner — exercising both suggested_owner branches.
+  ( cd "$REPO"
+    mkdir -p src docs
+    for i in 1 2 3 4 5; do
+      echo "s$i" >> src/file.txt
+      git -c user.email="42+alice@users.noreply.github.com" -c user.name="Alice W" add -A
+      git -c user.email="42+alice@users.noreply.github.com" -c user.name="Alice W" commit -q -m "feat: s$i"
+    done
+    for i in 1 2 3 4 5; do
+      echo "d$i" >> docs/readme.md
+      git -c user.email="bob@example.com" -c user.name="Bob Real" add -A
+      git -c user.email="bob@example.com" -c user.name="Bob Real" commit -q -m "docs: d$i"
+    done
+  )
+  validate_stdout_against derived-codeowners.schema.json \
+    bash "${REPO_ROOT}/bin/derive-codeowners.sh" --target "$REPO" --min-commits 5
+}
+
+@test "derived-codeowners schema: empty result (below threshold) validates as []" {
+  # No dir reaches --min-commits → script emits []. Must still validate as
+  # an array per the top-level schema type.
+  validate_stdout_against derived-codeowners.schema.json \
+    bash "${REPO_ROOT}/bin/derive-codeowners.sh" --target "$REPO" --min-commits 99
+}
+
+# --- GhIntegrationResult (gh-integration.sh) --------------------------------
+
+@test "gh-integration-result schema: skipped path emits valid shape (no gh)" {
+  # Point --gh at a path that doesn't exist so the gh-not-installed
+  # skip path runs deterministically without depending on the test
+  # host's actual gh state.
+  cat > "$TMP/no-gh.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "fake gh: not installed" >&2
+exit 127
+EOF
+  chmod +x "$TMP/no-gh.sh"
+  # check-prereqs needs PATH; gh-integration needs to find a gh that
+  # fails. Use --gh to specify a non-existent binary.
+  validate_stdout_against gh-integration-result.schema.json \
+    bash "${REPO_ROOT}/bin/gh-integration.sh" --target "$REPO" --profile nextjs-prototype --gh "/tmp/definitely-not-gh-$$"
+}
+
+# --- SetupStatus (setup.sh) -------------------------------------------------
+
+@test "setup-status schema: --check on a fresh user-root emits not_configured shape" {
+  fake_home="$TMP/home"
+  mkdir -p "$fake_home/.claude/nyann"
+  run bash "${REPO_ROOT}/bin/setup.sh" --check --json --user-root "$fake_home/.claude/nyann"
+  # Documented contract: exit 2 when no preferences.json exists yet; the JSON
+  # status payload is still emitted (and must validate against the schema).
+  [ "$status" -eq 2 ]
+  echo "$output" > "$TMP/out.json"
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/setup-status.schema.json" "$TMP/out.json"
+}
+
+@test "setup-status schema: --check on a configured user-root emits configured shape" {
+  fake_home="$TMP/home"
+  mkdir -p "$fake_home/.claude/nyann/profiles" "$fake_home/.claude/nyann/cache"
+  cat > "$fake_home/.claude/nyann/preferences.json" <<JSON
+{
+  "schemaVersion": 1,
+  "default_profile": "auto-detect",
+  "branching_strategy": "auto-detect",
+  "commit_format": "conventional-commits",
+  "gh_integration": true,
+  "documentation_storage": "local",
+  "auto_sync_team_profiles": false,
+  "setup_completed_at": "2026-04-25T00:00:00Z"
+}
+JSON
+  validate_stdout_against setup-status.schema.json \
+    env HOME="$fake_home" bash "${REPO_ROOT}/bin/setup.sh" --check --json --user-root "$fake_home/.claude/nyann"
+}
+
+# --- Suggestions (suggest-profile-updates.sh) -------------------------------
+
+@test "suggestions schema: suggest on a vanilla repo emits valid array" {
+  validate_stdout_against suggestions.schema.json \
+    bash "${REPO_ROOT}/bin/suggest-profile-updates.sh" \
+      --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+# --- ClaudemdAnalysis (analyze-claudemd-usage.sh) ---------------------------
+
+@test "claudemd-analysis schema: insufficient_data path emits valid shape" {
+  mkdir -p "$REPO/memory"
+  cat > "$REPO/CLAUDE.md" <<'MD'
+# Project
+<!-- nyann:start -->
+## Build
+- npm test
+<!-- nyann:end -->
+MD
+  cat > "$REPO/memory/claudemd-usage.json" <<'JSON'
+{ "sessions": 0, "sections": {}, "commands_run": {}, "docs_read": {} }
+JSON
+  validate_stdout_against claudemd-analysis.schema.json \
+    bash "${REPO_ROOT}/bin/analyze-claudemd-usage.sh" --target "$REPO"
+}
+
+# --- ClaudemdSizeReport (check-claude-md-size.sh) ---------------------------
+
+@test "claudemd-size-report schema: absent CLAUDE.md emits absent shape" {
+  validate_stdout_against claudemd-size-report.schema.json \
+    bash "${REPO_ROOT}/bin/check-claude-md-size.sh" \
+      --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+@test "claudemd-size-report schema: present CLAUDE.md emits present shape" {
+  echo "# Project" > "$REPO/CLAUDE.md"
+  validate_stdout_against claudemd-size-report.schema.json \
+    bash "${REPO_ROOT}/bin/check-claude-md-size.sh" \
+      --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+# --- StalenessReport (check-staleness.sh) -----------------------------------
+
+@test "staleness-report schema: profile w/o staleness_days emits disabled shape" {
+  # default.json leaves staleness_days unset → enabled:false branch.
+  validate_stdout_against staleness-report.schema.json \
+    bash "${REPO_ROOT}/bin/check-staleness.sh" \
+      --target "$REPO" --profile "${REPO_ROOT}/profiles/default.json"
+}
+
+# --- WorkspaceConfigs (resolve-workspace-configs.sh) ------------------------
+
+@test "workspace-configs schema: empty workspaces emits empty array" {
+  # No workspaces in profile → script emits []. Still must validate as an
+  # array (which the schema requires at the top level).
+  cat > "$TMP/stack.json" <<'JSON'
+{ "primary_language": "typescript", "secondary_languages": [], "is_monorepo": false }
+JSON
+  validate_stdout_against workspace-configs.schema.json \
+    bash "${REPO_ROOT}/bin/resolve-workspace-configs.sh" \
+      --profile "${REPO_ROOT}/profiles/default.json" --stack "$TMP/stack.json"
+}
+
+# --- MigrationPlan (switch-profile.sh) --------------------------------------
+
+@test "migration-plan schema: --json diff between two profiles validates" {
+  validate_stdout_against migration-plan.schema.json \
+    bash "${REPO_ROOT}/bin/switch-profile.sh" \
+      --from default --to nextjs-prototype --target "$REPO" --json
+}
+
+# A producer that emits schema-valid JSON to stdout *and then exits
+# non-zero* must fail the helper.
+@test "validate_stdout_against fails when producer exits non-zero" {
+  run validate_stdout_against action-plan.schema.json \
+    bash -c 'echo "{\"writes\":[],\"commands\":[],\"remote\":[]}"; exit 1'
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -Fq "producer exited 1"
+}
+
+# --- StackDescriptor iac block (v1.13.0 — no producer emits it yet) ---------
+# detect-stack.sh does not yet serialize an `iac` key (the IaC signals are
+# folded into archetype/framework/primary_language today). These cases pin
+# the optional, additive `iac` block contract directly so the per-tool
+# detector work in I2–I6 can start emitting it against a known shape.
+# Hand-rolled fixtures keep base fields within the *current* descriptor
+# enums so we exercise only the new block, not the pre-existing hcl/infra
+# enum gaps tracked by the detector-population features.
+
+@test "stack-descriptor schema: descriptor with full iac block validates" {
+  cat > "$TMP/desc.json" <<'JSON'
+{
+  "primary_language": "typescript",
+  "secondary_languages": ["python"],
+  "framework": null,
+  "package_manager": null,
+  "is_monorepo": true,
+  "monorepo_tool": null,
+  "workspaces": [],
+  "has_git": true,
+  "git_is_empty_repo": false,
+  "has_claude_md": false,
+  "existing_precommit_config": "none",
+  "existing_ci": "none",
+  "contributor_count": 1,
+  "has_changelog": false,
+  "has_semver_tags": false,
+  "confidence": 0.9,
+  "reasoning": ["iac detected"],
+  "iac": {
+    "tool": "aws-cdk",
+    "language": "typescript",
+    "units": [
+      { "kind": "stack", "path": "lib/api-stack", "name": "api", "version": "1.2.0", "depends_on": ["lib/base-stack"] },
+      { "kind": "stack", "path": "lib/base-stack", "name": "base", "version": null }
+    ],
+    "lockfiles": ["package-lock.json"],
+    "var_files": []
+  }
+}
+JSON
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/stack-descriptor.schema.json" "$TMP/desc.json"
+}
+
+@test "stack-descriptor schema: legacy descriptor WITHOUT iac still validates" {
+  cat > "$TMP/desc.json" <<'JSON'
+{
+  "primary_language": "typescript",
+  "secondary_languages": [],
+  "framework": "next",
+  "package_manager": "pnpm",
+  "is_monorepo": false,
+  "monorepo_tool": null,
+  "workspaces": [],
+  "has_git": true,
+  "git_is_empty_repo": false,
+  "has_claude_md": false,
+  "existing_precommit_config": "none",
+  "existing_ci": "github-actions",
+  "contributor_count": 1,
+  "has_changelog": true,
+  "has_semver_tags": true,
+  "confidence": 0.8,
+  "reasoning": ["package.json present"]
+}
+JSON
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/stack-descriptor.schema.json" "$TMP/desc.json"
+}
+
+@test "stack-descriptor schema: rejects an unknown iac.tool" {
+  cat > "$TMP/desc.json" <<'JSON'
+{
+  "primary_language": "unknown",
+  "secondary_languages": [],
+  "framework": null,
+  "package_manager": null,
+  "is_monorepo": false,
+  "monorepo_tool": null,
+  "workspaces": [],
+  "has_git": true,
+  "git_is_empty_repo": false,
+  "has_claude_md": false,
+  "existing_precommit_config": "none",
+  "existing_ci": "none",
+  "contributor_count": 0,
+  "has_changelog": false,
+  "has_semver_tags": false,
+  "confidence": 0.0,
+  "reasoning": [],
+  "iac": { "tool": "cloudformation" }
+}
+JSON
+  ! "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/stack-descriptor.schema.json" "$TMP/desc.json"
+}
+
+# --- CoverageBaseline (coverage-delta.sh --update-baseline) -----------------
+# The producer writes a FILE (.nyann/coverage-baseline.json), not stdout, so
+# we validate the written file directly. A JS coverage artifact feeds the
+# parser deterministically (no test suite is run).
+
+@test "coverage-baseline schema: --update-baseline writes a valid baseline" {
+  echo '{}' > "$REPO/package.json"
+  mkdir -p "$REPO/coverage"
+  echo '{"total":{"lines":{"pct":87.4}}}' > "$REPO/coverage/coverage-summary.json"
+  bash "${REPO_ROOT}/bin/guards/coverage-delta.sh" --update-baseline --target "$REPO"
+  [ -f "$REPO/.nyann/coverage-baseline.json" ]
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/coverage-baseline.schema.json" \
+    "$REPO/.nyann/coverage-baseline.json"
+}
+
+# --- Every schema is itself a valid JSON Schema -----------------------------
+# Guards against a malformed schema (bad metaschema, dangling $ref) shipping
+# unnoticed. check-jsonschema --check-metaschema validates each schema
+# document against the draft 2020-12 metaschema.
+
+@test "all schemas are valid JSON Schema (metaschema check)" {
+  run "${VALIDATE[@]}" --check-metaschema "${REPO_ROOT}"/schemas/*.schema.json
+  if [ "$status" -ne 0 ]; then echo "$output" >&2; fi
+  [ "$status" -eq 0 ]
+}
+
+# --- Fleet schemas (v1.14.0) -------------------------------------------------
+# fleet-registry: validate the FILE fleet.sh writes. fleet-report: cached
+# mode keeps the producer fast (no per-repo doctor run). fleet-run-result:
+# a --plan over the same one-repo fleet.
+
+@test "fleet-registry schema: fleet.sh --add writes a valid registry" {
+  fleet="$TMP/fleet.json"
+  bash "${REPO_ROOT}/bin/fleet.sh" --add "$REPO" --repo o/r --profile default \
+    --tag t1 --fleet-file "$fleet" 2>/dev/null
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/fleet-registry.schema.json" "$fleet"
+}
+
+@test "fleet-report schema: fleet-doctor --json --cached emits a valid report" {
+  fleet="$TMP/fleet.json"
+  bash "${REPO_ROOT}/bin/fleet.sh" --add "$REPO" --fleet-file "$fleet" 2>/dev/null
+  # A no-history repo is status=missing → worst-of exit 4; the JSON is
+  # complete either way.
+  rc=0
+  bash "${REPO_ROOT}/bin/fleet-doctor.sh" --fleet-file "$fleet" --json --cached \
+    > "$TMP/fleet-report.json" 2>/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ]
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/fleet-report.schema.json" "$TMP/fleet-report.json"
+}
+
+@test "fleet-run-result schema: fleet-retrofit --plan emits a valid result" {
+  fleet="$TMP/fleet.json"
+  bash "${REPO_ROOT}/bin/fleet.sh" --add "$REPO" --fleet-file "$fleet" 2>/dev/null
+  mkdir -p "$REPO/.nyann"
+  echo "default" > "$REPO/.nyann/profile"
+  # A drifted plan legitimately exits 4 — capture the JSON either way.
+  rc=0
+  bash "${REPO_ROOT}/bin/fleet-retrofit.sh" --plan --fleet-file "$fleet" \
+    > "$TMP/plan.json" 2>/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ]
+  "${VALIDATE[@]}" --schemafile "${REPO_ROOT}/schemas/fleet-run-result.schema.json" "$TMP/plan.json"
+}

@@ -1,0 +1,582 @@
+#!/usr/bin/env bash
+# doctor.sh — read-only hygiene audit.
+#
+# Usage: doctor.sh --target <repo> --profile <name>
+#                  [--json | --explain] [--persist] [--scope <csv>]
+#
+# Wraps bin/retrofit.sh --report-only so hygiene + profile-compliance
+# output is always identical between doctor and retrofit. doctor is the
+# read-only path: same analysis, never offers remediation, never writes
+# to the filesystem.
+#
+# --scope narrows the audit to one or more categories (any of docs,
+# hooks, branching, gitignore, editorconfig, github, history, all).
+# Default "all". When scope is narrower the health-score persist step
+# is silently skipped — a partial-scope score would corrupt the trend
+# series in memory/health.json.
+#
+# --persist (off by default) opts the user into recording the computed
+# health score to memory/health.json so trend deltas show up on
+# subsequent runs. Without --persist, doctor stays strictly read-only.
+# Trend display still works against any existing memory/health.json.
+#
+# --explain pipes the computed DriftReport through bin/explain-diff.sh
+# and emits a markdown narrative suitable for pasting into a PR body
+# or chat. Mutually exclusive with --json. Health score + trend delta
+# are forwarded so the narrative header line matches what text-mode
+# would print at the foot of the report.
+#
+# Covers hygiene + profile compliance + documentation drift (link check,
+# orphans, CLAUDE.md size).
+#
+# Exit codes (mirror retrofit):
+#   0 — clean (no drift)
+#   4 — warnings only (misconfigured / non-compliant history)
+#   5 — critical (missing files)
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+source "${_script_dir}/_lib.sh"
+
+nyann::require_cmd jq
+
+score_tmp=""
+tmp_profile=""
+load_err=""
+trap 'rm -f "${score_tmp:-}" "${tmp_profile:-}" "${load_err:-}"' EXIT
+
+target=""
+profile_name=""
+json_out=false
+persist=false
+scope="all"
+gh_bin="gh"
+explain=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)    target="${2:-}"; shift 2 ;;
+    --target=*)  target="${1#--target=}"; shift ;;
+    --profile)   profile_name="${2:-}"; shift 2 ;;
+    --profile=*) profile_name="${1#--profile=}"; shift ;;
+    --json)      json_out=true; shift ;;
+    --persist)   persist=true; shift ;;
+    --scope)     scope="${2:-all}"; shift 2 ;;
+    --scope=*)   scope="${1#--scope=}"; shift ;;
+    --gh)        gh_bin="${2:-}"; shift 2 ;;
+    --gh=*)      gh_bin="${1#--gh=}"; shift ;;
+    --explain)   explain=true; shift ;;
+    -h|--help)   sed -n '3,28p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) nyann::die "unknown argument: $1" ;;
+  esac
+done
+
+# --explain and --json are mutually exclusive — the narrative is
+# markdown for human consumption, not a JSON shape. If both are passed,
+# fail early rather than silently picking one.
+if $explain && $json_out; then
+  nyann::die "--explain and --json are mutually exclusive (one produces markdown, the other JSON)"
+fi
+
+[[ -n "$target" && -d "$target" ]] || nyann::die "--target <repo> is required and must be a directory"
+[[ -n "$profile_name" ]] || nyann::die "--profile <name> is required"
+
+if ! _bad_scope=$(nyann::valid_scope_csv "$scope"); then
+  nyann::die "unknown scope: $_bad_scope (want any of: docs hooks branching gitignore editorconfig github history all)"
+fi
+
+# Narrow scopes skip persist — a partial score would poison the trend
+# series. Operators can re-run with default --scope=all to refresh.
+scope_full=true
+if [[ "$scope" != "all" ]]; then
+  if [[ "$(nyann::canonical_scope "$scope")" != "all" ]]; then
+    scope_full=false
+  fi
+fi
+if $persist && ! $scope_full; then
+  nyann::warn "--scope is narrower than 'all'; skipping --persist (would corrupt trend series)"
+  persist=false
+fi
+
+# --- Load profile ONCE -------------------------------------------------------
+# Previously load-profile.sh ran separately to extract stale_days, then
+# retrofit.sh called it again internally. Now we load once and pass the
+# resolved profile to compute-drift.sh directly.
+tmp_profile=$(mktemp -t nyann-doctor-profile.XXXXXX)
+load_err=$(mktemp -t nyann-doctor-load.XXXXXX)
+"${_script_dir}/load-profile.sh" "$profile_name" > "$tmp_profile" 2>"$load_err" \
+  || { cat "$load_err" >&2; nyann::die "failed to load profile: $profile_name"; }
+
+stale_days=$(jq -r '.branching.stale_after_days // 90' "$tmp_profile" 2>/dev/null || echo 90)
+[[ "$stale_days" =~ ^[0-9]+$ ]] || stale_days=90
+
+# --- GitHub protection probe (read-only) ------------------------------------
+# Stderr passes through to the user terminal so legitimate diagnostics
+# (rate-limit warnings, expired-token messages, missing-scope errors)
+# surface instead of being silently swallowed into a "no issues" report.
+# The `|| echo '{}'` already shields against non-zero exits.
+protection_audit_json=$("${_script_dir}/gh-integration.sh" \
+  --target "$target" --profile "$profile_name" \
+  --gh "$gh_bin" --check || echo '{}')
+if [[ -z "$protection_audit_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$protection_audit_json" 2>/dev/null || echo "")" != "object" ]]; then
+  protection_audit_json='{}'
+fi
+pa_critical=$(jq -r '.summary.critical // 0' <<<"$protection_audit_json")
+pa_warn=$(jq -r '.summary.warn // 0' <<<"$protection_audit_json")
+
+# --- Stale-branch probe (read-only) -----------------------------------------
+# Same rationale: let stderr through so the user sees why a probe
+# fell back to {} (e.g. detached HEAD, no commits yet) instead of a
+# silent "no stale branches" misreport.
+stale_branches_json=$("${_script_dir}/check-stale-branches.sh" \
+  --target "$target" --days "$stale_days" || echo '{}')
+if [[ -z "$stale_branches_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$stale_branches_json" 2>/dev/null || echo "")" != "object" ]]; then
+  stale_branches_json='{}'
+fi
+sb_merged=$(jq -r '.summary.merged_count // 0' <<<"$stale_branches_json")
+sb_stale=$(jq -r '.summary.stale_count // 0' <<<"$stale_branches_json")
+
+# --- Documentation staleness probe (read-only) ------------------------------
+# Soft signal: which docs have drifted from their correlated sources.
+# Skipped (empty {}) when no docs/ directory exists or when the helper
+# fails for any reason — never blocks the audit.
+docs_staleness_json=$("${_script_dir}/docs-staleness.sh" \
+  --target "$target" --profile "$tmp_profile" 2>/dev/null || echo '{}')
+if [[ -z "$docs_staleness_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$docs_staleness_json" 2>/dev/null || echo "")" != "object" ]]; then
+  docs_staleness_json='{}'
+fi
+ds_stale=$(jq -r '.summary.stale_count // 0' <<<"$docs_staleness_json")
+
+# --- Public-doc drift probe (read-only) -------------------------------------
+# version-refs, file-refs, script-refs, count-claims findings in
+# README/CONTRIBUTING/SECURITY/docs/*.md. Soft signal: surfaced in the
+# drift section but never blocks the audit.
+docs_drift_json=$("${_script_dir}/docs-drift-scan.sh" \
+  --target "$target" --profile "$tmp_profile" 2>/dev/null || echo '{}')
+if [[ -z "$docs_drift_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$docs_drift_json" 2>/dev/null || echo "")" != "object" ]]; then
+  docs_drift_json='{}'
+fi
+dd_total=$(jq -r '.summary.total // 0' <<<"$docs_drift_json")
+dd_critical=$(jq -r '.summary.by_severity.critical // 0' <<<"$docs_drift_json")
+dd_high=$(jq -r '.summary.by_severity.high // 0' <<<"$docs_drift_json")
+
+# --- IaC drift probe (read-only) --------------------------------------------
+# unpinned-refs, missing-lockfile, secrets-in-vars, version-lag findings in
+# *.tf / Chart.yaml / Pulumi / tfvars / Ansible-vars files. Filesystem + git
+# only — no terraform plan, no cloud CLI. Soft signal: surfaced in its own
+# section but never blocks beyond exit-code escalation, exactly like
+# docs-drift. Score-isolated: it does NOT fold into the numeric health score
+# (compute-health-score reads only the DriftReport), only the exit code.
+iac_drift_json=$("${_script_dir}/iac-drift-scan.sh" \
+  --target "$target" --profile "$tmp_profile" 2>/dev/null || echo '{}')
+if [[ -z "$iac_drift_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$iac_drift_json" 2>/dev/null || echo "")" != "object" ]]; then
+  iac_drift_json='{}'
+fi
+id_total=$(jq -r '.summary.total // 0' <<<"$iac_drift_json")
+id_critical=$(jq -r '.summary.by_severity.critical // 0' <<<"$iac_drift_json")
+id_high=$(jq -r '.summary.by_severity.high // 0' <<<"$iac_drift_json")
+
+# --- Backgrounded sentinel probe (read-only) --------------------------------
+# Report any running / stale CI-sentinel daemon (v1.13.0 P8) so a
+# backgrounded watcher is never invisible — "doctor reports a running
+# sentinel". Purely informational: it never escalates the exit code or
+# touches the health score; a daemon is an operator choice, not drift. State
+# lives under the user root, independent of the target repo, so this works
+# even when --target isn't the watched repo.
+sentinel_json=$("${_script_dir}/sentinel-daemon.sh" report --json 2>/dev/null || echo '[]')
+if [[ -z "$sentinel_json" ]] || \
+   [[ "$(jq -r 'type' <<<"$sentinel_json" 2>/dev/null || echo "")" != "array" ]]; then
+  sentinel_json='[]'
+fi
+sd_running=$(jq -r '[.[] | select(.running)] | length' <<<"$sentinel_json" 2>/dev/null || echo 0)
+sd_stale=$(jq -r '[.[] | select(.stale)] | length' <<<"$sentinel_json" 2>/dev/null || echo 0)
+
+# --- Compute drift ONCE -------------------------------------------------------
+# Previously text mode ran retrofit.sh twice (once --json, once --report-only).
+# Now compute-drift.sh runs once; JSON mode wraps via retrofit.sh, text mode
+# renders directly from the captured JSON.
+retro_rc=0
+
+if $json_out; then
+  retro_output=$("${_script_dir}/retrofit.sh" --target "$target" --profile "$profile_name" --scope "$scope" --json) || retro_rc=$?
+  score_json=$(printf '%s\n' "$retro_output" | "${_script_dir}/compute-health-score.sh" 2>/dev/null || echo '{"score":0,"breakdown":{}}')
+
+  if $persist; then
+    score_tmp=$(mktemp -t nyann-score.XXXXXX)
+    printf '%s\n' "$score_json" > "$score_tmp"
+    "${_script_dir}/persist-health-score.sh" --target "$target" --score "$score_tmp" --profile "$profile_name" >/dev/null 2>&1 || true
+    rm -f "$score_tmp"
+  fi
+
+  printf '%s\n' "$retro_output" | jq \
+    --argjson hs "$score_json" \
+    --argjson pa "$protection_audit_json" \
+    --argjson sb "$stale_branches_json" \
+    --argjson ds "$docs_staleness_json" \
+    --argjson dd "$docs_drift_json" \
+    --argjson id "$iac_drift_json" \
+    --argjson sd "$sentinel_json" \
+    '. + { health_score: $hs, protection_audit: $pa, stale_branches: $sb, docs_staleness: $ds, docs_drift: $dd, iac_drift: $id, sentinel_daemons: $sd }'
+else
+  # Single compute-drift call replaces two retrofit.sh calls.
+  report=$("${_script_dir}/compute-drift.sh" --target "$target" --profile "$tmp_profile" --scope "$scope") \
+    || retro_rc=$?
+
+  # Validate the report shape before parsing. compute-drift can fail
+  # outright (non-zero rc, empty / partial output) — without this guard
+  # the @tsv read below would feed garbage to bash arithmetic later and
+  # we'd lose the original failure context. The drift schema requires a
+  # top-level `summary` object, so use that as the smoke test.
+  if ! jq -e 'type == "object" and (.summary | type) == "object"' \
+       >/dev/null 2>&1 <<<"$report"; then
+    nyann::die "compute-drift produced an invalid report (rc=${retro_rc:-?}); \
+re-run with NYANN_DEBUG=1 to see compute-drift's stderr"
+  fi
+
+  # Parse summary counters once. IFS=$'\t' so empty middle fields don't
+  # shift later variables under default IFS (which collapses tab runs).
+  IFS=$'\t' read -r n_missing n_mis n_off n_misplaced n_broken n_orphans n_stale n_subsys_errs claude_md_status < <(
+    jq -r '[
+      (.summary.missing // 0),
+      (.summary.misconfigured // 0),
+      (.summary.non_compliant_commits // 0),
+      (.summary.misplaced // 0),
+      (.summary.broken_links // 0),
+      (.summary.orphans // 0),
+      (.summary.stale_docs // 0),
+      (.summary.subsystem_errors // 0),
+      (.summary.claude_md_status // "ok")
+    ] | @tsv' <<<"$report"
+  )
+
+  # Determine which scope categories the report covered. Identical to
+  # retrofit.sh's render_report logic; kept inline since the two
+  # renderers are intentional duplicates of each other for now.
+  scope_applied=$(jq -r '(.scope_applied // []) | join(",")' <<<"$report")
+  scope_full_render=false
+  if [[ -z "$scope_applied" ]] || \
+     [[ "$(jq -r '.scope_applied // [] | length' <<<"$report")" == "7" ]]; then
+    scope_full_render=true
+  fi
+  in_scope() {
+    case ",${scope_applied}," in
+      *",$1,"*) return 0 ;;
+      *)        return 1 ;;
+    esac
+  }
+
+  # --- Explain mode: short-circuit text rendering -------------------------
+  # When --explain is set, bypass the text render block entirely and
+  # pipe the report through explain-diff.sh with health + trend hints.
+  # Exit code is still derived from drift signals so `doctor --explain;
+  # echo $?` discriminates clean / warn / critical the same way text
+  # mode does. Persist still honours --persist.
+  if $explain; then
+    # Exit code from drift signals (same logic as below).
+    has_critical=false
+    has_warn=false
+    (( n_missing > 0 )) && has_critical=true
+    (( n_broken > 0 )) && has_critical=true
+    [[ "$claude_md_status" == "error" ]] && has_critical=true
+    (( n_mis > 0 )) && has_warn=true
+    (( n_off > 0 )) && has_warn=true
+    (( n_orphans > 0 )) && has_warn=true
+    (( ${n_misplaced:-0} > 0 )) && has_warn=true
+    (( n_stale > 0 )) && has_warn=true
+    (( n_subsys_errs > 0 )) && has_warn=true
+    [[ "$claude_md_status" == "warn" || "$claude_md_status" == "absent" ]] && has_warn=true
+    if $has_critical; then retro_rc=5
+    elif $has_warn; then retro_rc=4
+    fi
+
+    # Compute score + trend (same source as text mode).
+    score_json=$(printf '%s\n' "$report" | "${_script_dir}/compute-health-score.sh" 2>/dev/null || echo '{"score":0,"breakdown":{}}')
+    score_val=$(jq -r '.score' <<<"$score_json")
+
+    explain_args=(--with-health "$score_val")
+    if [[ -f "$target/memory/health.json" ]]; then
+      delta_signed=$(jq -r '.trend.delta // 0' "$target/memory/health.json")
+      # Only forward if the value passes the same regex explain-diff
+      # validates against; otherwise drop the flag rather than fail.
+      if [[ "$delta_signed" =~ ^-?[0-9]+$ ]] && [[ "$delta_signed" != "0" ]]; then
+        explain_args+=(--with-trend "$delta_signed")
+      fi
+    fi
+
+    if $persist; then
+      score_tmp=$(mktemp -t nyann-score.XXXXXX)
+      printf '%s\n' "$score_json" > "$score_tmp"
+      "${_script_dir}/persist-health-score.sh" --target "$target" --score "$score_tmp" --profile "$profile_name" >/dev/null 2>&1 || true
+      rm -f "$score_tmp"
+    fi
+
+    printf '%s\n' "$report" | "${_script_dir}/explain-diff.sh" - "${explain_args[@]}"
+    exit "$retro_rc"
+  fi
+
+  # Render text report (mirrors retrofit.sh render_report).
+  {
+    printf '\nDrift vs. profile %q (target: %s)' "$profile_name" "$target"
+    if ! $scope_full_render; then
+      printf '\nScope: %s' "$scope_applied"
+    fi
+    printf '\n\n'
+    printf 'MISSING:\n'
+    if [[ "$n_missing" == "0" ]]; then
+      printf '  (none)\n'
+    else
+      jq -r '.missing[] | "  ✗ " + .path + ( if .detail then "   # " + .detail else "" end )' <<<"$report"
+    fi
+    printf '\nMISCONFIGURED:\n'
+    if [[ "$n_mis" == "0" ]]; then
+      printf '  (none)\n'
+    else
+      jq -r '.misconfigured[] |
+        "  ⚠ " + .path + " — " + .reason +
+        ( if .missing_entries then " (missing: " + (.missing_entries | join(", ")) + ")" else "" end )' <<<"$report"
+    fi
+    if in_scope history; then
+      printf '\nNON-COMPLIANT HISTORY (last %s commits):\n' "$(jq -r '.non_compliant_history.checked' <<<"$report")"
+      if [[ "$n_off" == "0" ]]; then
+        printf '  (none — informational only; history rewrites are out of scope)\n'
+      else
+        jq -r '.non_compliant_history.offenders[] | "  ⚠ " + .sha + "  " + .subject' <<<"$report"
+        printf '  (%s commit(s) above — informational only; history rewrites are out of scope)\n' "$n_off"
+      fi
+    fi
+
+    if in_scope docs; then
+    printf '\nDOCUMENTATION:\n'
+    case "$claude_md_status" in
+      ok)      printf '  ✓ CLAUDE.md %s B (under %s B budget)\n' \
+                 "$(jq -r '.documentation.claude_md.bytes' <<<"$report")" \
+                 "$(jq -r '.documentation.claude_md.budget_bytes' <<<"$report")" ;;
+      warn)    printf '  ⚠ CLAUDE.md %s B (> %s B soft budget)\n' \
+                 "$(jq -r '.documentation.claude_md.bytes' <<<"$report")" \
+                 "$(jq -r '.documentation.claude_md.budget_bytes' <<<"$report")" ;;
+      error)   printf '  ✗ CLAUDE.md %s B (> %s B hard cap — extract)\n' \
+                 "$(jq -r '.documentation.claude_md.bytes' <<<"$report")" \
+                 "$(jq -r '.documentation.claude_md.hard_cap_bytes' <<<"$report")" ;;
+      absent)  printf '  ⚠ CLAUDE.md missing (no router file present)\n' ;;
+      skipped) printf '  ⊘ CLAUDE.md not checked (docs scope excluded)\n' ;;
+    esac
+
+    checked_links=$(jq -r '.documentation.links.checked' <<<"$report")
+    if [[ "$n_broken" == "0" ]]; then
+      printf '  ✓ %s internal link(s) resolve\n' "$checked_links"
+    else
+      printf '  ✗ %s broken internal link(s):\n' "$n_broken"
+      jq -r '.documentation.links.broken[] | "      - " + .source + " → " + .link' <<<"$report"
+    fi
+
+    n_mcp=$(jq '.documentation.links.needs_mcp_verify | length' <<<"$report")
+    if [[ "$n_mcp" != "0" ]]; then
+      printf '  ⚠ %s MCP link(s) need connector verification (skill-layer)\n' "$n_mcp"
+    fi
+
+    if [[ "$n_orphans" == "0" ]]; then
+      printf '  ✓ 0 orphans in docs/ + memory/\n'
+    else
+      printf '  ⚠ %s orphan(s) in docs/ + memory/:\n' "$n_orphans"
+      jq -r '.documentation.orphans.orphans[] | "      - " + .path + "  (" + (.last_modified_days_ago|tostring) + " days)"' <<<"$report"
+    fi
+
+    if [[ "${n_misplaced:-0}" != "0" ]]; then
+      printf '  ⚠ %s doc(s) at non-canonical paths (run /nyann:retrofit to reorganize):\n' "$n_misplaced"
+      jq -r '.misplaced[] | "      - " + .source + " → " + .target + "  (confidence: " + (.confidence|tostring) + ")"' <<<"$report"
+    fi
+
+    staleness_enabled=$(jq -r '.documentation.staleness.enabled' <<<"$report")
+    if [[ "$staleness_enabled" == "true" ]]; then
+      threshold=$(jq -r '.documentation.staleness.threshold_days' <<<"$report")
+      if [[ "$n_stale" == "0" ]]; then
+        printf '  ✓ 0 docs past staleness threshold (%s days)\n' "$threshold"
+      else
+        printf '  ⚠ %s doc(s) past staleness threshold (%s days):\n' "$n_stale" "$threshold"
+        jq -r '.documentation.staleness.stale[] | "      - " + .path + "  (" + (.last_modified_days_ago|tostring) + " days)"' <<<"$report"
+      fi
+    fi
+
+    if (( n_subsys_errs > 0 )); then
+      printf '  ⚠ %s doc-check subsystem(s) failed to execute; results may be incomplete:\n' "$n_subsys_errs"
+      jq -r '.documentation.subsystem_errors[] | "      - " + .subsystem + ": " + .error' <<<"$report"
+    fi
+    fi  # in_scope docs
+
+    printf '\n'
+  } >&2
+
+  # Determine exit code from drift.
+  has_critical=false
+  has_warn=false
+  (( n_missing > 0 )) && has_critical=true
+  (( n_broken > 0 )) && has_critical=true
+  [[ "$claude_md_status" == "error" ]] && has_critical=true
+  (( n_mis > 0 )) && has_warn=true
+  (( n_off > 0 )) && has_warn=true
+  (( n_orphans > 0 )) && has_warn=true
+  (( ${n_misplaced:-0} > 0 )) && has_warn=true
+  (( n_stale > 0 )) && has_warn=true
+  (( n_subsys_errs > 0 )) && has_warn=true
+  # `skipped` is "docs scope wasn't run", not real drift; only `absent`
+# (file actually missing) counts as warn.
+[[ "$claude_md_status" == "warn" || "$claude_md_status" == "absent" ]] && has_warn=true
+
+  if $has_critical; then retro_rc=5
+  elif $has_warn; then retro_rc=4
+  fi
+
+  # Compute health score from the same drift JSON.
+  score_json=$(printf '%s\n' "$report" | "${_script_dir}/compute-health-score.sh" 2>/dev/null || echo '{"score":0,"breakdown":{}}')
+
+  score_val=$(jq -r '.score' <<<"$score_json")
+  breakdown=$(jq -r '.breakdown | to_entries | map(select(.value < 0)) | map("  \(.value)  \(.key)") | join("\n")' <<<"$score_json")
+
+  trend_delta=""
+  if [[ -f "$target/memory/health.json" ]]; then
+    trend_dir=$(jq -r '.trend.direction // "stable"' "$target/memory/health.json")
+    trend_d=$(jq -r '.trend.delta // 0' "$target/memory/health.json")
+    case "$trend_dir" in
+      up)     trend_delta=" (↑${trend_d} from last session)" ;;
+      down)   trend_delta=" (↓${trend_d#-} from last session)" ;;
+      stable) trend_delta=" (→ stable)" ;;
+    esac
+  fi
+
+  printf '\nHEALTH SCORE: %s/100%s\n' "$score_val" "$trend_delta"
+  if [[ -n "$breakdown" ]]; then
+    printf '%s\n' "$breakdown"
+  fi
+
+  if $persist; then
+    score_tmp=$(mktemp -t nyann-score.XXXXXX)
+    printf '%s\n' "$score_json" > "$score_tmp"
+    "${_script_dir}/persist-health-score.sh" --target "$target" --score "$score_tmp" --profile "$profile_name" >/dev/null 2>&1 || true
+    rm -f "$score_tmp"
+  fi
+fi
+
+# --- protection probe → exit code + text-mode display -----------------------
+# In text mode, render a compact one-section summary so users see the
+# audit alongside drift + health. JSON mode already merged the audit
+# above. Either way, fold critical/warn counts into the exit code so
+# `doctor; echo $?` still discriminates clean / warn / critical.
+if (( pa_critical > 0 )); then
+  retro_rc=5
+elif (( pa_warn > 0 )) && (( retro_rc < 4 )); then
+  retro_rc=4
+fi
+if ! $json_out; then
+  pa_total=$(jq -r '.summary.total_drift // 0' <<<"$protection_audit_json")
+  if (( pa_total > 0 )); then
+    printf '\nGITHUB PROTECTION: %s drift item(s) (%s critical, %s warn)\n' \
+      "$pa_total" "$pa_critical" "$pa_warn"
+    jq -r '
+      ([.branches[]? | select(.drift | length > 0) |
+        "  ✗ branches/" + .name + ": " +
+        ((.drift | map(.field) | unique | join(", ")))]
+       + (if (.tag_protection.skipped // false) then []
+          elif ((.tag_protection.drift // []) | length) > 0 then
+            ["  ✗ tags: " + ((.tag_protection.drift | map(.field) | unique | join(", ")))]
+          else [] end)
+       + (if ((.codeowners_gate.drift // []) | length) > 0 then
+            ["  ✗ codeowners: " + ((.codeowners_gate.drift | map(.kind) | unique | join(", ")))]
+          else [] end)
+       + (if (.security.skipped // false) then []
+          elif ((.security.drift // []) | length) > 0 then
+            ["  ✗ security: " + ((.security.drift | map(.field) | unique | join(", ")))]
+          else [] end)
+      ) | .[]
+    ' <<<"$protection_audit_json"
+  fi
+  # Stale-branch summary — informational; doesn't change exit code.
+  # Surfaces the action so users can run /nyann:cleanup-branches.
+  if (( sb_merged > 0 )) || (( sb_stale > 0 )); then
+    printf '\nLOCAL BRANCHES: %s merged-into-base (deletable), %s stale unmerged (>%s days)\n' \
+      "$sb_merged" "$sb_stale" "$stale_days"
+    if (( sb_merged > 0 )); then
+      printf '  ⚠ run /nyann:cleanup-branches to prune the merged set\n'
+    fi
+  fi
+  # Documentation staleness — informational; surfaces the doc files
+  # whose correlated sources have churned since the doc was last
+  # touched, so the user knows where to start when refreshing docs.
+  if (( ds_stale > 0 )); then
+    printf '\nDOC STALENESS: %s file(s) where correlated sources have churned\n' "$ds_stale"
+    jq -r '.findings[] | "  ⚠ " + .doc + " — " + .reason' <<<"$docs_staleness_json" 2>/dev/null | head -5
+    if (( ds_stale > 5 )); then
+      printf '  … and %s more (re-run with --json for the full list)\n' "$(( ds_stale - 5 ))"
+    fi
+  fi
+  # Public-doc drift — version refs older than the latest tag, broken
+  # markdown links, missing npm/make script targets, count-claim drift.
+  # critical/high findings escalate exit code (mirrors gh-protection
+  # behavior); medium/low are informational only.
+  if (( dd_total > 0 )); then
+    printf '\nPUBLIC-DOC DRIFT: %s finding(s) (%s critical, %s high)\n' \
+      "$dd_total" "$dd_critical" "$dd_high"
+    jq -r '.findings[] | "  " + (if .severity == "critical" or .severity == "high" then "✗" else "⚠" end) + " " + .file + (if .line then ":\(.line)" else "" end) + " — " + .message' \
+      <<<"$docs_drift_json" 2>/dev/null | head -10
+    if (( dd_total > 10 )); then
+      printf '  … and %s more (re-run with --json for the full list)\n' "$(( dd_total - 10 ))"
+    fi
+    if (( dd_critical > 0 )) && (( retro_rc < 5 )); then
+      retro_rc=5
+    elif (( dd_high > 0 )) && (( retro_rc < 4 )); then
+      retro_rc=4
+    fi
+  fi
+  # IaC drift — committed secrets (critical), unpinned refs / unpinned
+  # providers / unpinned deps (high), missing lockfiles + version-lag
+  # (medium). critical/high escalate exit code (mirrors gh-protection +
+  # docs-drift); medium/low are informational only. Score-isolated: this
+  # section never touches the numeric health score.
+  if (( id_total > 0 )); then
+    printf '\nIAC DRIFT: %s finding(s) (%s critical, %s high)\n' \
+      "$id_total" "$id_critical" "$id_high"
+    jq -r '.findings[] | "  " + (if .severity == "critical" or .severity == "high" then "✗" else "⚠" end) + " " + .file + (if .line then ":\(.line)" else "" end) + " — " + .message' \
+      <<<"$iac_drift_json" 2>/dev/null | head -10
+    if (( id_total > 10 )); then
+      printf '  … and %s more (re-run with --json for the full list)\n' "$(( id_total - 10 ))"
+    fi
+    if (( id_critical > 0 )) && (( retro_rc < 5 )); then
+      retro_rc=5
+    elif (( id_high > 0 )) && (( retro_rc < 4 )); then
+      retro_rc=4
+    fi
+  fi
+  # Backgrounded sentinel — informational; never changes the exit code. A
+  # running daemon is surfaced so the operator knows it's there; a stale one
+  # (pid file present, process dead) is flagged with the reap CTA.
+  if (( sd_running > 0 )) || (( sd_stale > 0 )); then
+    printf '\nCI SENTINEL: %s running, %s stale\n' "$sd_running" "$sd_stale"
+    jq -r '.[] | "  " + (if .running then "●" elif .stale then "✗" else "○" end)
+      + " " + (.repo // "?")
+      + (if .pid then " (pid \(.pid)" else " (" end)
+      + (if .supervisor then ", \(.supervisor)" else "" end) + ")"
+      + (if .stale then " — STALE; run /nyann:watch --stop to reap" else "" end)' \
+      <<<"$sentinel_json" 2>/dev/null | head -10
+  fi
+fi
+
+# Apply doc-drift + iac-drift exit-code escalation in JSON mode too (text mode
+# does it inline above). The text-mode blocks are gated on `! $json_out`.
+if $json_out; then
+  if (( dd_critical > 0 )) && (( retro_rc < 5 )); then
+    retro_rc=5
+  elif (( dd_high > 0 )) && (( retro_rc < 4 )); then
+    retro_rc=4
+  fi
+  if (( id_critical > 0 )) && (( retro_rc < 5 )); then
+    retro_rc=5
+  elif (( id_high > 0 )) && (( retro_rc < 4 )); then
+    retro_rc=4
+  fi
+fi
+
+exit "$retro_rc"

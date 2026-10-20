@@ -1,0 +1,219 @@
+#!/usr/bin/env bats
+# All starter + user-fixture profiles validate via bin/validate-profile.sh.
+
+setup() {
+  REPO_ROOT="$(cd "${BATS_TEST_DIRNAME}/../.." && pwd)"
+  VALIDATE="${REPO_ROOT}/bin/validate-profile.sh"
+}
+
+@test "starter: default.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/default.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: nextjs-prototype.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/nextjs-prototype.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: python-cli.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/python-cli.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: typescript-library.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/typescript-library.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: react-vite.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/react-vite.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: node-api.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/node-api.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: fastapi-service.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/fastapi-service.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: django-app.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/django-app.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: go-service.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/go-service.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: rust-cli.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/rust-cli.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: java-spring-boot.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/java-spring-boot.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: dotnet-api.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/dotnet-api.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: php-laravel.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/php-laravel.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: flutter-app.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/flutter-app.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: ruby-rails.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/ruby-rails.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "fixture: valid-minimal → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/valid-minimal.json"
+  [ "$status" -eq 0 ]
+}
+
+# v1.13.0 IaC foundation: the optional top-level `iac` block, the
+# `opentofu` package manager, and IaC tool names as free-string
+# frameworks (terraform/aws-cdk/helm/...) must all validate additively —
+# and the iac block's enums + additionalProperties:false must REJECT
+# malformed input, so a future schema relaxation surfaces immediately.
+
+@test "fixture: valid-iac → exit 0 (iac block + opentofu pm + free-string framework)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/valid-iac.json"
+  [ "$status" -eq 0 ]
+}
+
+# BUG 10 lock: stack.package_manager = "terraform" must validate. The
+# stack-descriptor schema already lists "terraform"; the profile schema
+# omitted it, so a profile pinning package_manager:"terraform" was rejected.
+@test "fixture: valid-pm-terraform → exit 0 (package_manager terraform)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/valid-pm-terraform.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: terraform-monorepo.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/terraform-monorepo.json"
+  [ "$status" -eq 0 ]
+}
+
+# v1.13.0 (I8): the 6 IaC profiles each carry an iac.drift_check block with
+# per-tool detector defaults. All must validate after the additive schema
+# change (the drift_check object inside iac.properties).
+
+@test "starter: aws-cdk-app.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/aws-cdk-app.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: pulumi-app.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/pulumi-app.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: kubernetes-app.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/kubernetes-app.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: helm-chart.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/helm-chart.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "starter: ansible-playbook.json → exit 0" {
+  run bash "$VALIDATE" "${REPO_ROOT}/profiles/ansible-playbook.json"
+  [ "$status" -eq 0 ]
+}
+
+# v1.13.0 (I8): the optional iac.drift_check block — master enabled + four
+# flat per-detector booleans + scanned_files[] — must validate additively,
+# and additionalProperties:false must REJECT unknown / typo'd detector flags
+# so a future schema relaxation surfaces immediately.
+
+@test "fixture: valid-iac-drift-check → exit 0 (full drift_check block)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/valid-iac-drift-check.json"
+  [ "$status" -eq 0 ]
+}
+
+@test "fixture: invalid-iac-drift-check-prop → exit 4 (unknown key in drift_check)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-iac-drift-check-prop.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-iac-tool → exit 4 (iac.tool outside enum)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-iac-tool.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-iac-extra-prop → exit 4 (unknown key in iac block)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-iac-extra-prop.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-iac-unit-kind → exit 4 (units[].kind outside enum)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-iac-unit-kind.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-missing-stack → exit 4 + stack error" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-missing-stack.json"
+  [ "$status" -eq 4 ]
+  echo "$output" | grep -q "'stack' is a required property"
+}
+
+@test "validate rejects a malformed JSON file (exit 3)" {
+  tmp=$(mktemp)
+  echo "{not json" > "$tmp"
+  run bash "$VALIDATE" "$tmp"
+  [ "$status" -eq 3 ]
+  rm -f "$tmp"
+}
+
+@test "validate reports missing file (exit 2)" {
+  run bash "$VALIDATE" "/tmp/does-not-exist-nyann-test-$$.json"
+  [ "$status" -eq 2 ]
+}
+
+# Schema strictness regressions: release/documentation fields that flow
+# into shell or write paths must be regex-locked. These fixtures encode
+# the exact attack shapes (path traversal, option injection, shell
+# metachars) so a future schema relaxation surfaces immediately.
+
+@test "fixture: invalid-changelog-traversal → exit 4 (path traversal)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-changelog-traversal.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-tag-prefix-injection → exit 4 (option injection)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-tag-prefix-injection.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-preferred-mcp-shellmeta → exit 4 (shell metachars)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-preferred-mcp-shellmeta.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-workspace-hook-id → exit 4 (path traversal in hook id)" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-workspace-hook-id.json"
+  [ "$status" -eq 4 ]
+}
+
+@test "fixture: invalid-workspace-key → exit 4 (workspace key starts with '-')" {
+  run bash "$VALIDATE" "${REPO_ROOT}/tests/fixtures/profiles/invalid-workspace-key.json"
+  [ "$status" -eq 4 ]
+}

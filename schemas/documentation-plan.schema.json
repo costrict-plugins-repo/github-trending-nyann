@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nyann.dev/schemas/documentation-plan/v1.json",
+  "title": "DocumentationPlan",
+  "description": "Where each doc type will live (local, obsidian, notion, split). MCP routing is planned for a future release.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["storage_strategy", "targets", "claude_md_mode", "size_budget_kb", "staleness_days"],
+  "properties": {
+    "storage_strategy": {
+      "type": "string",
+      "enum": ["local", "obsidian", "notion", "split"]
+    },
+    "targets": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/target"
+      }
+    },
+    "claude_md_mode": {
+      "type": "string",
+      "enum": ["router", "content", "off"]
+    },
+    "size_budget_kb": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "staleness_days": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 1 }
+      ]
+    },
+    "archetype": {
+      "$comment": "v1.6.0 — codebase archetype carried through the planner so scaffold-docs.sh can apply per-archetype scaffold maps without re-detecting. Optional.",
+      "type": "string",
+      "enum": ["api-service", "cli-tool", "library", "web-app", "mobile-app", "plugin", "unknown"]
+    },
+    "use_archetype_scaffolds": {
+      "$comment": "v1.6.0 — when true, scaffold-docs.sh uses the per-archetype map instead of the flat scaffold_types list. Mirrors the profile field of the same name; route-docs.sh propagates it from profile.documentation.use_archetype_scaffolds. Omitted from emitted plans when false; consumers MUST treat the absent field as false.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type":    { "type": "string", "enum": ["local", "obsidian", "notion"] },
+        "path":    { "type": "string" },
+        "page_id": { "type": "string" },
+        "url":     { "type": "string" },
+        "vault":   { "type": "string" },
+        "folder":  { "type": "string" },
+        "link_in_claude_md": { "type": "string" }
+      }
+    }
+  }
+}

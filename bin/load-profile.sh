@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# load-profile.sh — resolve and load a nyann profile by name.
+#
+# Usage: load-profile.sh <name> [--user-root <dir>] [--plugin-root <dir>]
+#
+# Resolution order (user > team > starter):
+#   1. $user_root/profiles/<name>.json                 (user overrides)
+#   2. $user_root/cache/<source>/profiles/<name>.json  (team sources)
+#      A namespaced name `source/name` forces the team version even
+#      when a user profile shadows it.
+#   3. $plugin_root/profiles/<name>.json               (starter profiles)
+#
+# Validates the chosen file via bin/validate-profile.sh. On success, emits the
+# profile JSON to stdout (canonical pretty). Logs the resolved source to
+# stderr so callers know which layer won.
+#
+# Exit codes:
+#   0 — found and valid
+#   2 — profile not found in any tier (stderr lists what's available)
+#   4 — profile found but fails schema validation
+
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_lib.sh
+source "${_script_dir}/_lib.sh"
+
+nyann::require_cmd jq
+
+plugin_root="$(cd "${_script_dir}/.." && pwd)"
+user_root="${HOME}/.claude/nyann"
+
+name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user-root)     user_root="${2:-}"; shift 2 ;;
+    --user-root=*)   user_root="${1#--user-root=}"; shift ;;
+    --plugin-root)   plugin_root="${2:-}"; shift 2 ;;
+    --plugin-root=*) plugin_root="${1#--plugin-root=}"; shift ;;
+    -h|--help)
+      sed -n '3,22p' "${BASH_SOURCE[0]}"
+      exit 0
+      ;;
+    --*) nyann::die "unknown flag: $1" ;;
+    *)
+      [[ -z "$name" ]] || nyann::die "unexpected extra arg: $1 (name already set to $name)"
+      name="$1"; shift
+      ;;
+  esac
+done
+
+[[ -n "$name" ]] || nyann::die "usage: load-profile.sh <name>"
+
+# Name shape: bare `profile-name`, OR namespaced `team-source/profile-name`.
+# Each segment must match the same regex add-team-source.sh enforces so a
+# caller cannot smuggle `..` or path separators into the filesystem lookup
+# below.
+if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)?$ ]]; then
+  nyann::die "invalid profile name: $name (must be [a-z0-9][a-z0-9-]* or team/[a-z0-9][a-z0-9-]*)"
+fi
+
+list_available() {
+  local root label n
+  for pair in "${user_root}/profiles:user" "${plugin_root}/profiles:starter"; do
+    root="${pair%:*}"; label="${pair#*:}"
+    [[ -d "$root" ]] || continue
+    shopt -s nullglob
+    for f in "$root"/*.json; do
+      n="$(basename "$f" .json)"
+      [[ "$n" == "_schema" ]] && continue
+      printf '  - %s  (%s)\n' "$n" "$label"
+    done
+    shopt -u nullglob
+  done
+  # Team sources live under $user_root/cache/<source>/profiles/ OR directly
+  # under $user_root/cache/<source>/.
+  if [[ -d "${user_root}/cache" ]]; then
+    shopt -s nullglob
+    for srcdir in "${user_root}/cache"/*; do
+      [[ -d "$srcdir" ]] || continue
+      local src
+      src="$(basename "$srcdir")"
+      for f in "$srcdir"/profiles/*.json "$srcdir"/*.json; do
+        [[ -f "$f" ]] || continue
+        n="$(basename "$f" .json)"
+        [[ "$n" == "_schema" ]] && continue
+        printf '  - %s/%s  (team)\n' "$src" "$n"
+      done
+    done
+    shopt -u nullglob
+  fi
+}
+
+resolved=""
+source_label=""
+
+# Team-namespaced name (source/name) → look in that cache only.
+if [[ "$name" == */* ]]; then
+  src="${name%%/*}"
+  pname="${name#*/}"
+  for candidate in \
+    "${user_root}/cache/${src}/profiles/${pname}.json" \
+    "${user_root}/cache/${src}/${pname}.json"; do
+    if [[ -f "$candidate" ]]; then
+      resolved="$candidate"
+      source_label="team:${src}"
+      break
+    fi
+  done
+else
+  # Bare name: user → team → starter.
+  user_path="${user_root}/profiles/${name}.json"
+  plugin_path="${plugin_root}/profiles/${name}.json"
+  team_hit=""
+  if [[ -d "${user_root}/cache" ]]; then
+    shopt -s nullglob
+    for srcdir in "${user_root}/cache"/*; do
+      [[ -d "$srcdir" ]] || continue
+      for candidate in "$srcdir/profiles/${name}.json" "$srcdir/${name}.json"; do
+        if [[ -f "$candidate" ]]; then
+          team_hit="$candidate"
+          break 2
+        fi
+      done
+    done
+    shopt -u nullglob
+  fi
+
+  if [[ -f "$user_path" ]]; then
+    resolved="$user_path"; source_label="user"
+  elif [[ -n "$team_hit" ]]; then
+    resolved="$team_hit"; source_label="team:$(basename "$(dirname "$(dirname "$team_hit")")" 2>/dev/null || basename "$(dirname "$team_hit")")"
+  elif [[ -f "$plugin_path" ]]; then
+    resolved="$plugin_path"; source_label="starter"
+  else
+    nyann::warn "profile not found: ${name}"
+    nyann::warn "searched:"
+    nyann::warn "  $user_path"
+    [[ -d "${user_root}/cache" ]] && nyann::warn "  ${user_root}/cache/*/{,/profiles/}${name}.json"
+    nyann::warn "  $plugin_path"
+    {
+      printf '[nyann] available profiles:\n'
+      list_available
+    } >&2
+    exit 2
+  fi
+fi
+
+if [[ -z "$resolved" ]]; then
+  nyann::warn "profile not found: ${name}"
+  {
+    printf '[nyann] available profiles:\n'
+    list_available
+  } >&2
+  exit 2
+fi
+
+nyann::log "loading profile '${name}' from ${source_label}: ${resolved}"
+
+# Collision detection. Computed once and surfaced two ways: as nyann::log
+# lines (for direct CLI users + inspect-profile readers) AND as a
+# structured _meta field on the emitted JSON below (so skill-layer
+# callers can programmatically warn the user without scraping stderr).
+shadowed_starter=""
+shadowed_team_csv=""
+if [[ "$source_label" == "user" ]]; then
+  starter_candidate="${plugin_root}/profiles/${name}.json"
+  if [[ -f "$starter_candidate" ]]; then
+    shadowed_starter="$starter_candidate"
+    nyann::log "user profile shadows starter at ${starter_candidate}"
+  fi
+  if [[ -d "${user_root}/cache" ]]; then
+    shopt -s nullglob
+    for srcdir in "${user_root}/cache"/*; do
+      [[ -d "$srcdir" ]] || continue
+      for cand in "$srcdir/profiles/${name}.json" "$srcdir/${name}.json"; do
+        if [[ -f "$cand" ]]; then
+          shadowed_team_csv="${shadowed_team_csv:+${shadowed_team_csv}	}${cand}"
+          nyann::log "user profile shadows team profile at ${cand}"
+        fi
+      done
+    done
+    shopt -u nullglob
+  fi
+fi
+
+# Auto-migrate if the file is older than the current schema. migrate-profile.sh
+# currently targets v1 (no-op), but the hook is live so a future v1→v2 bump
+# just needs the migration filter + a bump of NYANN_CURRENT_SCHEMA in
+# bin/_lib.sh — not a loader rewrite.
+CURRENT_SCHEMA="$NYANN_CURRENT_SCHEMA"
+
+# Always work from a mktemp'd copy of the resolved profile. Two wins:
+#   1. Closes the validate/read TOCTOU — a concurrent swap between
+#      validate-profile.sh and `jq '.' "$resolved"` would let
+#      unvalidated JSON reach the caller. Reading a local copy once
+#      makes the validated bytes and the emitted bytes identical by
+#      construction.
+#   2. Unifies the cleanup path. $tmp_resolved + $validate_err now
+#      live in the same EXIT trap, so a non-zero exit can't orphan
+#      the profile JSON (which may contain credentials) in /tmp.
+tmp_resolved=$(mktemp -t nyann-load-resolved.XXXXXX)
+validate_err=$(mktemp -t nyann-load-validate.XXXXXX)
+_extends_tmpfiles=()
+trap 'rm -f "$tmp_resolved" "$validate_err" "${_extends_tmpfiles[@]+"${_extends_tmpfiles[@]}"}"' EXIT
+
+file_version=$(jq -r '.schemaVersion // 1' "$resolved" 2>/dev/null || echo 1)
+if [[ "$file_version" =~ ^[0-9]+$ ]] && (( file_version < CURRENT_SCHEMA )); then
+  nyann::log "profile at schemaVersion ${file_version}; auto-migrating to v${CURRENT_SCHEMA} in memory"
+  # Guard the migrate call: under inherited `set -o errexit` a bare
+  # `migrated=$(...)` would abort load with migrate-profile.sh's raw exit
+  # code and no context. The `if !` form lets us attach a clear message.
+  if ! migrated=$("${_script_dir}/migrate-profile.sh" "$resolved"); then
+    nyann::die "auto-migration of profile '${name}' (${resolved}) failed"
+  fi
+  printf '%s\n' "$migrated" > "$tmp_resolved"
+else
+  cp "$resolved" "$tmp_resolved"
+fi
+
+# --- extends resolution -------------------------------------------------------
+# When the profile declares `extends`, recursively resolve the parent
+# chain and deep-merge. Max depth: 3. Circular detection via visited set.
+# Depth and visited are tracked via env vars so they persist across the
+# recursive load-profile.sh subprocess calls.
+_extends_chain=()
+_extends_resolved=false
+
+# Inherit depth/visited from parent process (recursive load-profile.sh calls)
+_NYANN_EXTENDS_DEPTH="${_NYANN_EXTENDS_DEPTH:-0}"
+_NYANN_EXTENDS_VISITED="${_NYANN_EXTENDS_VISITED:-}"
+
+extends_field=$(jq -r '.extends // empty' "$tmp_resolved" 2>/dev/null)
+if [[ -n "$extends_field" ]]; then
+  if ! [[ "$extends_field" =~ ^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)?$ ]]; then
+    nyann::die "extends: invalid parent profile name in '$name': $extends_field"
+  fi
+  parent_name="$extends_field"
+
+  current_depth=$((_NYANN_EXTENDS_DEPTH + 1))
+  if (( current_depth > 3 )); then
+    nyann::die "profile inheritance chain exceeds max depth of 3 (chain: ${_NYANN_EXTENDS_VISITED} $name → $parent_name)"
+  fi
+
+  if [[ " $_NYANN_EXTENDS_VISITED " == *" $parent_name "* ]]; then
+    nyann::die "circular profile inheritance detected: ${_NYANN_EXTENDS_VISITED} $name → $parent_name"
+  fi
+
+  nyann::log "extends: resolving parent '$parent_name' (depth $current_depth)"
+
+  parent_file=$(mktemp -t nyann-extends-parent.XXXXXX)
+  _extends_tmpfiles+=("$parent_file")
+
+  # Pass depth and visited set via env vars to the child load-profile.sh
+  _extends_load_err=$(mktemp -t nyann-extends-err.XXXXXX)
+  _extends_tmpfiles+=("$_extends_load_err")
+  if ! _NYANN_EXTENDS_DEPTH="$current_depth" \
+       _NYANN_EXTENDS_VISITED="${_NYANN_EXTENDS_VISITED} $name" \
+       "${_script_dir}/load-profile.sh" "$parent_name" \
+       --user-root "$user_root" --plugin-root "$plugin_root" > "$parent_file" 2>"$_extends_load_err"; then
+    # Propagate the child's error message so depth/circular errors surface
+    cat "$_extends_load_err" >&2 2>/dev/null || true
+    nyann::die "extends: parent profile '$parent_name' could not be loaded"
+  fi
+
+  # Extract the parent's extends chain from _meta (if it also extended something)
+  parent_chain=$(jq -r '._meta.extends_chain // [] | .[]' "$parent_file" 2>/dev/null)
+  _extends_chain=("$name")
+  while IFS= read -r pc; do
+    [[ -n "$pc" ]] && _extends_chain+=("$pc")
+  done <<<"$parent_chain"
+  # If parent didn't extend, just add its name
+  if (( ${#_extends_chain[@]} == 1 )); then
+    _extends_chain+=("$parent_name")
+  fi
+
+  # Merge: parent is base, current is overlay
+  merged_file=$(mktemp -t nyann-extends-merged.XXXXXX)
+  _extends_tmpfiles+=("$merged_file")
+
+  "${_script_dir}/merge-profiles.sh" --base "$parent_file" --overlay "$tmp_resolved" > "$merged_file"
+  cp "$merged_file" "$tmp_resolved"
+
+  _extends_resolved=true
+  nyann::log "extends: resolved chain: ${_extends_chain[*]}"
+fi
+
+# Validate via validate-profile.sh against the snapshot.
+# Starter profiles ship pre-validated in the plugin release, so skip the
+# expensive validator (uvx/check-jsonschema subprocess) when a per-profile
+# sentinel confirms this exact file content was validated against the
+# current plugin version.
+#
+# Sentinel file (one per starter profile): ${plugin_root}/profiles/_validated/<name>
+# Sentinel contents: "<plugin_version>:<sha256-of-profile-file>"
+#
+# Keying on (version, sha256) gives:
+#   - downgrade-safe (1.4.0 → 1.3.0): plugin_version mismatches → re-validate
+#   - mid-version edit detection: a hand-edited starter no longer matches
+#     its sha256 → re-validate (and the new sha256 is stamped only after
+#     successful validation, so a corrupt edit can't poison the cache)
+_skip_validation=false
+_plugin_version=""
+_profile_sha=""
+_sentinel_file=""
+if [[ "$source_label" == "starter" ]]; then
+  _plugin_version=$(jq -r '.version // ""' "${_script_dir}/../.claude-plugin/plugin.json" 2>/dev/null || echo "")
+  if command -v shasum >/dev/null 2>&1; then
+    _profile_sha=$(shasum -a 256 "$tmp_resolved" 2>/dev/null | awk '{print $1}')
+  elif command -v sha256sum >/dev/null 2>&1; then
+    _profile_sha=$(sha256sum "$tmp_resolved" 2>/dev/null | awk '{print $1}')
+  fi
+  if [[ -n "$_plugin_version" && -n "$_profile_sha" ]]; then
+    _sentinel_file="${plugin_root}/profiles/_validated/$(basename "${resolved%.json}").stamp"
+    if [[ -f "$_sentinel_file" ]]; then
+      _sentinel_value=$(<"$_sentinel_file")
+      [[ "$_sentinel_value" == "${_plugin_version}:${_profile_sha}" ]] && _skip_validation=true
+    fi
+  fi
+fi
+
+if $_skip_validation; then
+  nyann::log "starter profile validation skipped (sentinel matches v${_plugin_version})"
+else
+  # Guard the call: under inherited `set -o errexit` a bare invocation
+  # would abort before the diagnostics ran (and surface jq's exit 5 on
+  # malformed JSON instead of the documented exit 4). The `if !` form
+  # keeps the failure branch reachable and pins the exit code.
+  if ! "${_script_dir}/validate-profile.sh" "$tmp_resolved" >/dev/null 2>"$validate_err"; then
+    cat "$validate_err" >&2 || true
+    nyann::warn "profile failed validation: ${resolved}"
+    exit 4
+  fi
+  # Stamp the per-profile sentinel only after a successful validation.
+  if [[ "$source_label" == "starter" && -n "$_plugin_version" && -n "$_profile_sha" && -n "$_sentinel_file" ]]; then
+    mkdir -p "$(dirname "$_sentinel_file")" 2>/dev/null || true
+    printf '%s:%s' "$_plugin_version" "$_profile_sha" > "$_sentinel_file" 2>/dev/null || true
+  fi
+fi
+
+# Inject _meta on emit. The JSON in $tmp_resolved is the validated
+# profile; layering _meta after validation keeps the file-on-disk
+# contract clean (no _meta in stored profiles) while letting
+# downstream skill callers see resolution metadata without scraping
+# stderr. Schema permits _meta as an optional top-level extension.
+shadowed_team_json='[]'
+if [[ -n "$shadowed_team_csv" ]]; then
+  shadowed_team_json=$(printf '%s' "$shadowed_team_csv" | tr '\t' '\n' \
+    | jq -R . | jq -s 'map(select(. != ""))')
+fi
+extends_chain_json='[]'
+if (( ${#_extends_chain[@]} > 0 )); then
+  extends_chain_json=$(printf '%s\n' "${_extends_chain[@]}" | jq -R . | jq -s .)
+fi
+jq \
+  --arg src "$source_label" \
+  --arg src_path "$resolved" \
+  --arg shadowed_starter "$shadowed_starter" \
+  --argjson shadowed_team "$shadowed_team_json" \
+  --argjson extends_chain "$extends_chain_json" \
+  --argjson extends_resolved "$_extends_resolved" \
+  '. + {
+     _meta: ({source: $src, source_path: $src_path}
+       + (if $shadowed_starter != "" then {shadowed_starter: $shadowed_starter} else {} end)
+       + (if ($shadowed_team | length) > 0 then {shadowed_team: $shadowed_team} else {} end)
+       + (if $extends_resolved then {extends_chain: $extends_chain, extends_resolved: true} else {} end))
+   }' "$tmp_resolved"

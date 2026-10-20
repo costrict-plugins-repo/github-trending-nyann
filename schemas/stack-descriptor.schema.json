@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nyann.dev/schemas/stack-descriptor/v1.json",
+  "title": "StackDescriptor",
+  "description": "Output of bin/detect-stack.sh. Captures everything the downstream branching recommender, hook installer, and docs router need to know about a repo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "primary_language",
+    "secondary_languages",
+    "framework",
+    "package_manager",
+    "is_monorepo",
+    "monorepo_tool",
+    "workspaces",
+    "has_git",
+    "git_is_empty_repo",
+    "has_claude_md",
+    "existing_precommit_config",
+    "existing_ci",
+    "contributor_count",
+    "has_changelog",
+    "has_semver_tags",
+    "confidence",
+    "reasoning"
+  ],
+  "properties": {
+    "primary_language": {
+      "type": "string",
+      "enum": ["typescript", "javascript", "python", "go", "rust", "swift", "kotlin", "shell", "java", "csharp", "php", "dart", "ruby", "elixir", "cpp", "unknown", "hcl", "yaml"]
+    },
+    "secondary_languages": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["typescript", "javascript", "python", "go", "rust", "swift", "kotlin", "shell", "java", "csharp", "php", "dart", "ruby", "elixir", "cpp", "hcl", "yaml"]
+      },
+      "uniqueItems": true
+    },
+    "framework": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "enum": [
+            "next", "nuxt", "remix", "sveltekit", "react", "vue",
+            "astro",
+            "express", "fastify", "nestjs",
+            "deno",
+            "django", "flask", "fastapi",
+            "gin", "echo",
+            "actix", "axum", "rocket",
+            "spring-boot", "quarkus", "micronaut",
+            "aspnet", "blazor", "maui",
+            "laravel", "symfony",
+            "flutter",
+            "rails", "sinatra",
+            "phoenix",
+            "cmake",
+            "terraform", "cdk", "pulumi", "helm", "kustomize", "kubernetes", "ansible"
+          ]
+        }
+      ]
+    },
+    "package_manager": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "enum": [
+            "npm", "pnpm", "yarn", "bun",
+            "pip", "poetry", "uv", "pipenv",
+            "cargo",
+            "go",
+            "spm",
+            "gradle", "maven",
+            "dotnet",
+            "composer",
+            "pub",
+            "bundler",
+            "deno",
+            "mix",
+            "terraform", "opentofu"
+          ]
+        }
+      ]
+    },
+    "is_monorepo": { "type": "boolean" },
+    "monorepo_tool": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "enum": ["turbo", "nx", "pnpm-workspaces", "lerna", "cargo-workspace"]
+        }
+      ]
+    },
+    "has_git": { "type": "boolean" },
+    "git_is_empty_repo": { "type": "boolean" },
+    "has_claude_md": { "type": "boolean" },
+    "existing_precommit_config": {
+      "type": "string",
+      "enum": ["pre-commit.com", "husky", "none"]
+    },
+    "existing_ci": {
+      "type": "string",
+      "enum": ["github-actions", "none"],
+      "$comment": "Enum trimmed to values detect-stack.sh actually emits. v1.0 is GitHub-only per CLAUDE.md scope; gitlab-ci / circleci values were advertised but had no detector, leading consumers to branch on values that can never occur."
+    },
+    "contributor_count": { "type": "integer", "minimum": 0 },
+    "has_changelog": { "type": "boolean" },
+    "has_semver_tags": { "type": "boolean" },
+    "archetype": {
+      "$comment": "v1.6.0 — codebase archetype. What kind of system is this? Drives archetype-aware Project Memory scaffolding when documentation.use_archetype_scaffolds is true. Optional — emitted by detect-stack.sh; absent on legacy descriptors.",
+      "type": "string",
+      "enum": ["api-service", "cli-tool", "library", "web-app", "mobile-app", "plugin", "unknown", "infra"]
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "reasoning": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "workspaces": {
+      "type": "array",
+      "description": "Per-workspace mini-descriptors when is_monorepo is true. Each entry is a subset of StackDescriptor scoped to one workspace dir.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "primary_language"],
+        "properties": {
+          "path":             { "type": "string", "minLength": 1 },
+          "primary_language": {
+            "type": "string",
+            "enum": ["typescript", "javascript", "python", "go", "rust", "swift", "kotlin", "shell", "java", "csharp", "php", "dart", "ruby", "elixir", "cpp", "unknown", "hcl", "yaml"]
+          },
+          "framework": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "string" }
+            ]
+          },
+          "package_manager": {
+            "oneOf": [
+              { "type": "null" },
+              { "type": "string" }
+            ]
+          }
+        }
+      }
+    },
+    "iac": {
+      "$comment": "v1.13.0 — Infrastructure-as-Code descriptor block. Generalizes detect-iac.sh's flat signals into one shape so detection, hooks, drift, plan/apply, and per-unit versioning all read from a single source. Optional — emitted only for infra repos; absent on every non-IaC descriptor, so legacy descriptors still validate.",
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Detected Infrastructure-as-Code shape: the driving tool, its language, the discovered deployable/versionable units, and the lock/var files downstream drift and plan/apply subsystems read.",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "enum": ["terraform", "opentofu", "aws-cdk", "pulumi", "kubernetes", "kustomize", "helm", "ansible"]
+        },
+        "language": {
+          "$comment": "CDK/Pulumi are polyglot — the language is read from the project config (cdk.json app field, Pulumi runtime:), not assumed from the tool.",
+          "type": "string",
+          "enum": ["hcl", "typescript", "python", "go", "csharp", "yaml"]
+        },
+        "units": {
+          "type": "array",
+          "description": "Discovered deployable/versionable units (modules, stacks, charts, overlays, playbooks, roles). version is null when the unit isn't independently versioned.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "path", "name"],
+            "properties": {
+              "kind":    {
+                "type": "string",
+                "enum": ["module", "stack", "chart", "overlay", "playbook", "role"]
+              },
+              "path":    { "type": "string", "minLength": 1 },
+              "name":    { "type": "string", "minLength": 1 },
+              "version": {
+                "oneOf": [
+                  { "type": "null" },
+                  { "type": "string" }
+                ]
+              },
+              "depends_on": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        },
+        "lockfiles": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "var_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,712 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nyann.dev/schemas/profile/v1.json",
+  "title": "NyannProfile",
+  "description": "A saved nyann bootstrap configuration.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "schemaVersion",
+    "stack",
+    "branching",
+    "hooks",
+    "extras",
+    "conventions",
+    "documentation"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Runtime metadata injected by bin/load-profile.sh after a profile is resolved. NOT present on profile files at rest — writing this field into a stored profile is meaningless because the loader overwrites it. Skill-layer callers read _meta to detect shadowing without scraping stderr.",
+      "properties": {
+        "source": { "type": "string", "pattern": "^(user|starter|team(:[a-zA-Z0-9_-]+)?)$" },
+        "source_path": { "type": "string", "description": "Filesystem path of the resolved profile." },
+        "shadowed_starter": { "type": "string", "description": "Path to a starter profile that this user/team profile shadowed (omit when nothing was shadowed)." },
+        "shadowed_team": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Paths to team profiles shadowed by this user profile."
+        },
+        "extends_chain": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "v1.11.0 — ordered list of profile names from child to root when extends was used.",
+          "description": "Profile name chain from child to root ancestor, e.g. [\"my-react\", \"react-vite\", \"node-api\"]."
+        },
+        "extends_resolved": {
+          "type": "boolean",
+          "$comment": "v1.11.0 — true when extends was present and successfully resolved.",
+          "description": "True when the profile used extends and the chain was resolved."
+        }
+      }
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$",
+      "description": "Lowercase-kebab profile identifier."
+    },
+    "extends": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)?$",
+      "$comment": "v1.11.0 — optional parent profile name to inherit from. Child fields overlay parent via deep merge; arrays replace (not concatenate). Max chain depth: 3. Workspace inline profiles cannot use extends. Supports namespaced team/name format.",
+      "description": "Name of a parent profile to inherit from. Resolution follows the same user > team > starter chain as load-profile.sh. May use namespace/name for team profiles."
+    },
+    "description": { "type": "string" },
+    "schemaVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Profile schema version. Incremented on breaking changes."
+    },
+    "archetype": {
+      "$comment": "v1.6.0 — codebase archetype. 'infra' covers IaC monorepos (Terraform/CDK/Pulumi/K8s/Helm). When set, overrides detect-stack.sh's auto-detected archetype during scaffolding. Drives archetype-aware Project Memory scaffolding when documentation.use_archetype_scaffolds is true. Optional.",
+      "type": "string",
+      "enum": ["api-service", "cli-tool", "library", "web-app", "mobile-app", "plugin", "infra", "unknown"]
+    },
+    "stack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary_language"],
+      "properties": {
+        "primary_language": {
+          "type": "string",
+          "enum": ["typescript", "javascript", "python", "go", "rust", "swift", "kotlin", "shell", "java", "csharp", "php", "dart", "ruby", "elixir", "cpp", "hcl", "yaml", "unknown"]
+        },
+        "framework": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$" }
+          ]
+        },
+        "package_manager": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "enum": ["npm", "pnpm", "yarn", "bun", "pip", "uv", "poetry", "pipenv", "cargo", "go", "spm", "gradle", "maven", "dotnet", "composer", "pub", "bundler", "deno", "mix", "terraform", "opentofu"] }
+          ]
+        }
+      }
+    },
+    "branching": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "base_branches"],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["github-flow", "gitflow", "trunk-based"]
+        },
+        "base_branches": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._/-]*$" },
+          "minItems": 1
+        },
+        "branch_name_patterns": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "feature": { "type": "string" },
+            "bugfix":  { "type": "string" },
+            "release": { "type": "string" },
+            "hotfix":  { "type": "string" }
+          }
+        },
+        "stale_after_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650,
+          "description": "Age threshold (in days) for `bin/check-stale-branches.sh`. Local branches whose last commit is older than this AND that are not merged into a base branch are flagged as `stale_unmerged`. Doctor folds the result into its drift display. Default 90."
+        }
+      }
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pre_commit", "commit_msg", "pre_push"],
+      "properties": {
+        "pre_commit": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } },
+        "commit_msg": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } },
+        "pre_push":   { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } }
+      }
+    },
+    "extras": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gitignore":               { "type": "boolean" },
+        "editorconfig":            { "type": "boolean" },
+        "claude_md":               { "type": "boolean" },
+        "github_actions_ci":       { "type": "boolean" },
+        "github_templates":        { "type": "boolean" },
+        "commit_message_template": { "type": "boolean" },
+        "dependency_updater": {
+          "description": "Generate a dependency-updater config when bootstrapping or retrofitting (bin/gen-dependency-updater.sh). Three valid forms: `false` (off — current default; preserves backward-compat), `\"dependabot\"` (emit .github/dependabot.yml using the profile's stack to pick ecosystems), or `\"renovate\"` (emit renovate.json with config:recommended). Opt-in: starter profiles do NOT flip this on automatically — set it explicitly to opt your repo in.",
+          "oneOf": [
+            { "type": "boolean", "const": false },
+            { "type": "string", "enum": ["dependabot", "renovate"] }
+          ]
+        },
+        "devcontainer": {
+          "type": "boolean",
+          "description": "When true, bin/gen-devcontainer.sh emits a .devcontainer/devcontainer.json keyed to the profile's primary_language. Default false (opt-in) so existing repos don't get a devcontainer materialised on the next bootstrap/retrofit without explicit consent. The generated file is preview-then-apply with idempotent re-runs; user edits survive on subsequent regenerations only when the rendered output happens to match byte-for-byte (otherwise the operator sees a diff and chooses overwrite vs. preserve)."
+        }
+      }
+    },
+    "ci": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional CI workflow generation settings. Controls GitHub Actions workflow output.",
+      "properties": {
+        "enabled":        { "type": "boolean" },
+        "node_version":   { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+        "python_version": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+        "go_version":     { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" }
+      }
+    },
+    "conventions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit_format"],
+      "properties": {
+        "commit_format": {
+          "type": "string",
+          "enum": ["conventional-commits", "custom", "unknown"]
+        },
+        "commit_scopes": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]*$" } }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "GitHub branch / tag / repo-security settings. Used by `bin/gh-integration.sh` for both --apply (write protection) and --check (audit protection drift via the doctor probe).",
+      "properties": {
+        "enable_branch_protection": { "type": "boolean" },
+        "require_pr_reviews":       {
+          "type": "integer", "minimum": 0, "maximum": 6,
+          "description": "Number of approving PR reviews required to merge into a strategy-declared branch. 0 disables the review-required rule entirely (single-developer flow)."
+        },
+        "require_status_checks":    {
+          "type": "array",
+          "items": {
+            "type": "string", "minLength": 1,
+            "pattern": "^[A-Za-z0-9 _.\\-/()]+$",
+            "description": "Status-check context name as it appears in GitHub's Branch protection screen. Matrix-job names include the matrix vector (e.g. 'lint + bats (ubuntu-latest)')."
+          },
+          "uniqueItems": true,
+          "description": "Status checks that MUST pass before merging into a strategy-declared branch. Empty array means no required checks."
+        },
+        "require_code_owner_reviews": {
+          "type": "boolean",
+          "description": "When true, branch protection requires a review from a CODEOWNERS-listed reviewer. Only meaningful when a CODEOWNERS file exists; gh-integration.sh --check warns when this is true but no CODEOWNERS file ships in the repo, and warns when CODEOWNERS exists but the gate is off."
+        },
+        "tag_protection_pattern": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9*?_./-]+$",
+          "description": "fnmatch-style tag pattern that should be protected against deletion + force-push (e.g. 'v*'). Audited via the GitHub Rulesets API; setting this enables the tag_protection section of `gh-integration.sh --check`. Absent = audit skipped."
+        },
+        "require_signed_commits": {
+          "type": "boolean",
+          "description": "When true, branch protection requires GPG/SSH-signed commits on strategy-declared branches. The audit also reads the local `commit.gpgsign` git config (warn when remote requires signing but local config is unset)."
+        },
+        "require_signed_tags": {
+          "type": "boolean",
+          "description": "When true, the audit asserts the local `tag.gpgsign` config is on. There is no GitHub-side rule for required signed tags; this is purely a local-config audit so release.sh's `git tag` commands produce signed tags."
+        },
+        "allow_squash_merge": {
+          "type": "boolean",
+          "description": "When true, audit asserts the repo allows squash-merge from the PR merge button. Mirrors the GitHub repo setting `allow_squash_merge`."
+        },
+        "allow_rebase_merge": {
+          "type": "boolean",
+          "description": "When true, audit asserts the repo allows rebase-merge from the PR merge button. Mirrors `allow_rebase_merge`."
+        },
+        "allow_merge_commit": {
+          "type": "boolean",
+          "description": "When true, audit asserts the repo allows merge-commits from the PR merge button. Mirrors `allow_merge_commit`. Most projects want exactly one of squash / rebase / merge-commit enabled."
+        },
+        "delete_branch_on_merge": {
+          "type": "boolean",
+          "description": "When true, audit asserts the repo auto-deletes head branches after merge. Mirrors `delete_branch_on_merge`. Recommended for hygiene; pairs with the local cleanup-branches skill."
+        },
+        "auto_merge_strategy": {
+          "type": "string",
+          "enum": ["squash", "rebase", "merge"],
+          "description": "Merge strategy `bin/pr.sh --auto-merge` uses when calling `gh pr merge --auto`. Default `squash` when unset. The repo must allow the chosen strategy via .github.allow_*_merge for auto-merge to succeed; the audit catches that mismatch in the repo_settings section."
+        },
+        "codeowners": {
+          "$comment": "v1.11.0 — explicit path → owner mappings for CODEOWNERS generation. Applies to both monorepo and single-repo profiles. Listed last in generated CODEOWNERS so they take precedence (GitHub uses last-match-wins).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["pattern", "owners"],
+            "additionalProperties": false,
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "description": "CODEOWNERS glob pattern (e.g. '/src/api/' or '*.proto')."
+              },
+              "owners": {
+                "type": "array",
+                "items": { "type": "string", "pattern": "^@[a-zA-Z0-9_/-]+$" },
+                "minItems": 1,
+                "description": "GitHub handles or team slugs (e.g. '@alice', '@org/team-name')."
+              }
+            }
+          }
+        }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional CI governance gate configuration. Controls doctor-ci.sh behavior when run as a PR check.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "When true, gen-ci --governance generates the governance-check workflow. Default true when the block is present."
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Minimum health score (0-100) to pass the CI gate. Default 70."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["block", "warn", "off"],
+          "description": "block = fail the check when score < threshold; warn = annotate but pass; off = skip entirely. Default 'block'."
+        },
+        "ignore": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["missing", "misconfigured", "non_compliant", "broken_links", "claude_md", "orphans", "stale", "subsystem_errors"]
+          },
+          "uniqueItems": true,
+          "description": "Health-score categories to exclude from the CI gate score. Useful for suppressing noisy checks (e.g. orphans, stale) in early adoption."
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional release-skill configuration. When absent, release skill defaults to conventional-changelog against CHANGELOG.md.",
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["conventional-changelog", "changesets", "release-please", "manual"]
+        },
+        "changelog_path": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+          "maxLength": 256,
+          "description": "Relative path (from repo root) where CHANGELOG entries are appended. Must not start with '-' (option injection) or contain '..' (path traversal)."
+        },
+        "tag_prefix": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$",
+          "description": "Prefix for version tags (default: 'v'). Must not start with '-' (option injection) or contain shell metacharacters."
+        },
+        "bump_files": {
+          "type": "array",
+          "description": "Files to mutate in-place during release.sh --bump-manifests. Each entry declares a path + format + format-specific args. Bumps land in the release commit alongside CHANGELOG.md.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "format"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.][A-Za-z0-9._/-]*$",
+                "not": { "pattern": "(^|/)\\.{1,2}(/|$)" },
+                "maxLength": 256,
+                "description": "Relative path from repo root. Must not start with '-' (option injection); leading '.' is permitted so dotfile-prefixed paths like '.claude-plugin/plugin.json' work. The `not` clause additionally rejects any segment that is exactly '.' or '..' (catches '../foo', './foo', 'foo/../bar', '..', and '.' alone), making path-traversal a schema-layer error rather than relying on the bin/release.sh runtime check alone."
+              },
+              "format": {
+                "type": "string",
+                "enum": ["json-version-key", "toml-version-key", "yaml-version-key", "text-version", "script"],
+                "description": "How to mutate the file. json-version-key uses jq; toml-version-key sed-edits a single-line `version = \"x.y.z\"` within a section; yaml-version-key rewrites a top-level `version:` (Helm Chart.yaml) and optionally `appVersion:`; text-version overwrites a whole-file VERSION sentinel (terraform module); script invokes a user-provided command with $NEW_VERSION."
+              },
+              "key": {
+                "type": "string",
+                "pattern": "^\\.[A-Za-z_][A-Za-z0-9_]*(\\[[0-9]+\\]|\\.[A-Za-z_][A-Za-z0-9_]*)*$",
+                "maxLength": 128,
+                "description": "json-version-key: jq path to the version field (e.g. '.version' or '.plugins[0].version'). REQUIRED for json-version-key. Restricted to dotted-identifier + numeric-array-index forms so a profile can't smuggle a multi-step jq pipeline (e.g. `. | env`) through the bumper. Any character not in [A-Za-z0-9._\\[\\]] is rejected."
+              },
+              "section": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "maxLength": 64,
+                "description": "toml-version-key: TOML section header WITHOUT brackets (e.g. 'project' or 'package'). The first single-line `version = \"...\"` after `[<section>]` is rewritten. REQUIRED for toml-version-key."
+              },
+              "command": {
+                "type": "string",
+                "maxLength": 512,
+                "description": "script: shell command run with $NEW_VERSION exported. The command is responsible for mutating the file at .path. REQUIRED for script."
+              },
+              "app_version": {
+                "type": "boolean",
+                "description": "yaml-version-key only: when true, ALSO rewrite the chart's `appVersion:` to the release version (mirrors the deployed app's release tag for a paired Helm chart). Ignored by other formats."
+              }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "format": { "const": "json-version-key" } }, "required": ["format"] },
+                "then": { "required": ["key"] }
+              },
+              {
+                "if": { "properties": { "format": { "const": "toml-version-key" } }, "required": ["format"] },
+                "then": { "required": ["section"] }
+              },
+              {
+                "if": { "properties": { "format": { "const": "script" } }, "required": ["format"] },
+                "then": { "required": ["command"] }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "workspaces": {
+      "type": "object",
+      "description": "Per-workspace config overrides for monorepos. Keys are relative paths (e.g. 'apps/web', 'packages/api') or '*' for all unmatched workspaces. Merged with detected workspace stacks by bin/resolve-workspace-configs.sh.",
+      "propertyNames": {
+        "pattern": "^(\\*|[A-Za-z0-9][A-Za-z0-9._/-]{0,127})$",
+        "description": "Either '*' for the catch-all override or a repo-relative path. Path constraint matches base_branches[]'s shape so workspace keys can't smuggle leading-dash or shell-metachar values into resolve-workspace-configs.sh."
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profile": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "description": "Name of a profile to apply to this workspace (e.g. 'flutter-app', 'node-api'). When set, resolve-workspace-configs.sh loads the full profile and merges its hooks/extras/ci into this workspace's config. If absent, the workspace inherits the root profile."
+          },
+          "hooks": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "pre_commit": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } },
+              "commit_msg": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } },
+              "pre_push":   { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" } }
+            }
+          },
+          "extras": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "gitignore":    { "type": "boolean" },
+              "editorconfig": { "type": "boolean" }
+            }
+          },
+          "ci": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-workspace CI overrides applied on top of the workspace's resolved profile (named or root). Booleans toggle individual phases; version fields override the matrix runtime.",
+            "properties": {
+              "enabled":        { "type": "boolean" },
+              "lint":           { "type": "boolean" },
+              "typecheck":      { "type": "boolean" },
+              "test":           { "type": "boolean" },
+              "node_version":   { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+              "python_version": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+              "go_version":     { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+              "dart_version":   { "type": "string" }
+            }
+          },
+          "documentation": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-workspace documentation scaffolding override. When present, the workspace's doc scaffolds are driven by this subset of fields (merged onto the named-profile or root documentation block).",
+            "properties": {
+              "scaffold_types": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": ["architecture", "prd", "adrs", "research", "api_reference", "runbook", "deployment", "glossary"]
+                },
+                "uniqueItems": true
+              }
+            }
+          },
+          "owner": {
+            "type": "string",
+            "pattern": "^@[a-zA-Z0-9_/-]+$",
+            "description": "GitHub handle (@user or @org/team) for CODEOWNERS."
+          }
+        }
+      }
+    },
+    "documentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scaffold_types", "storage_strategy", "claude_md_mode"],
+      "properties": {
+        "scaffold_types": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["architecture", "prd", "adrs", "research", "api_reference", "runbook", "deployment", "glossary"]
+          },
+          "uniqueItems": true
+        },
+        "use_archetype_scaffolds": {
+          "$comment": "v1.6.0 — opt-in flag for archetype-aware Project Memory scaffolding. When true, scaffold_types is replaced by the per-archetype map at scaffold time (api-service → architecture/api-reference/runbook/deployment/adrs/glossary, cli-tool → architecture/runbook/adrs/glossary, etc.). When false or absent, the flat scaffold_types list is used (pre-v1.6.0 behavior).",
+          "type": "boolean",
+          "default": false
+        },
+        "storage_strategy": {
+          "type": "string",
+          "enum": ["local", "obsidian", "notion", "split"]
+        },
+        "preferred_mcp": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$" }
+          ]
+        },
+        "adr_format": {
+          "type": "string",
+          "enum": ["madr", "nygard", "custom"]
+        },
+        "claude_md_mode": {
+          "type": "string",
+          "enum": ["router", "content", "off"]
+        },
+        "claude_md_size_budget_kb": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "staleness_days": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 1 }
+          ]
+        },
+        "staleness_threshold_commits": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minimum number of correlated source commits to flag a doc as stale. Default 5 when omitted."
+        },
+        "staleness_threshold_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Fallback days threshold for staleness detection. Default 30 when omitted."
+        },
+        "drift_check": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Public-doc governance configuration. Each detector can be toggled independently; count_claims requires explicit tracked_counts to be useful.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "scanned_files": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "version_refs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "enabled": { "type": "boolean", "default": true } }
+            },
+            "file_refs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "enabled": { "type": "boolean", "default": true } }
+            },
+            "script_refs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "enabled": { "type": "boolean", "default": true } }
+            },
+            "count_claims": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean", "default": false },
+                "tracked_counts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["keyword", "source"],
+                    "properties": {
+                      "keyword": { "type": "string" },
+                      "source":  { "type": "string", "enum": ["filesystem-glob"] },
+                      "glob":    { "type": "string" },
+                      "extract": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            },
+            "ignore_lines": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "readme_badges": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "README shields.io badge generator. Master `enabled` plus per-badge sub-flags.",
+          "properties": {
+            "enabled":         { "type": "boolean", "default": false },
+            "license":         { "type": "boolean", "default": true },
+            "ci":              { "type": "boolean", "default": true },
+            "release":         { "type": "boolean", "default": true },
+            "tests":           { "type": "boolean", "default": false },
+            "health":          { "type": "boolean", "default": false },
+            "package_manager": { "type": "boolean", "default": false }
+          }
+        },
+        "readme_stack_icons": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "README skillicons.dev tech-stack icon block.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "enable_drift_checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "broken_internal_links": { "type": "boolean" },
+            "broken_mcp_links":      { "type": "boolean" },
+            "orphans":               { "type": "boolean" },
+            "staleness":             { "type": "boolean" }
+          }
+        },
+        "glossary": {
+          "$comment": "v1.7.0 — glossary auto-population. When auto_populate is true AND scaffold_types includes glossary (or archetype scaffolds emit it), bin/scaffold-glossary.sh seeds docs/glossary.md from detected exported types in the codebase. The detected block lives between <!-- nyann:glossary:auto-start --> and <!-- nyann:glossary:auto-end --> markers and is regenerated idempotently; user content outside the markers is preserved.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "auto_populate": {
+              "type": "boolean",
+              "default": false,
+              "description": "Opt-in. Default false to preserve v1.6.0 behaviour."
+            },
+            "max_terms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50,
+              "description": "Cap on auto-detected terms. Detector picks the top N by external reference count so the glossary stays bounded per the size-budgeted Project Memory property."
+            },
+            "languages": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": ["auto", "go", "ts", "js", "python", "rust", "java", "kotlin", "swift"]
+              },
+              "default": ["auto"],
+              "description": "Restrict detection to specific languages. \"auto\" lets the detector use the StackDescriptor's primary + secondary languages."
+            }
+          }
+        }
+      }
+    },
+    "guards": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Pre-action guard configuration. Per-flow arrays declare which guards to run; profiles may promote (advisory → confirm/critical) but never silently demote. Omitting a flow means 'run all built-in guards at their built-in severity'.",
+      "properties": {
+        "commit":  { "$ref": "#/$defs/GuardList" },
+        "pr":      { "$ref": "#/$defs/GuardList" },
+        "release": { "$ref": "#/$defs/GuardList" },
+        "ship":    { "$ref": "#/$defs/GuardList" },
+        "coverage_delta_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "Max coverage-percentage-point drop the coverage-delta guard tolerates before it warns. 0 = any drop warns."
+        }
+      }
+    },
+    "iac": {
+      "$comment": "v1.13.0 — optional Infrastructure-as-Code pinning block. Mirrors the stack-descriptor iac shape so a profile can pin the tool and declare which repo-relative paths are deployable units when auto-discovery (detect-iac.sh / discover-iac-units.sh) is ambiguous. Additive and fully optional: absent on non-infra profiles; presence overrides nothing for repos that ignore it.",
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Infrastructure-as-Code overrides. Pins the IaC tool and/or declares deployable units so per-unit versioning, drift, and doc routing key off real paths instead of guessing.",
+      "properties": {
+        "tool": {
+          "type": "string",
+          "enum": ["terraform", "opentofu", "aws-cdk", "pulumi", "kubernetes", "kustomize", "helm", "ansible"]
+        },
+        "units": {
+          "type": "array",
+          "description": "Deployable/versionable units declared by the operator. Each maps a kind + repo-relative path to a logical name; version is an optional pin.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "path", "name"],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["module", "stack", "chart", "overlay", "playbook", "role"]
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.][A-Za-z0-9._/-]*$",
+                "not": { "pattern": "(^|/)\\.{1,2}(/|$)" },
+                "maxLength": 256,
+                "description": "Repo-relative path to the unit (e.g. 'modules/vpc'). Must not start with '-' (option injection); the `not` clause rejects '.'/'..' path segments (traversal), matching release.bump_files[].path."
+              },
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9-]*$",
+                "description": "Lowercase-kebab logical identifier for the unit. Same shape as the top-level profile `name`."
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+                "maxLength": 64,
+                "description": "Optional pinned version of the unit (e.g. a Helm chart version or module ref). Free-form within a safe charset."
+              }
+            }
+          }
+        },
+        "drift_check": {
+          "$comment": "v1.13.0 (I8) — IaC drift governance. Read by bin/iac-drift-scan.sh, doctor's iac-drift probe, and the unpinned-iac-refs/committed-secrets guards. Flat-boolean per-detector toggles (mirroring documentation.readme_badges, and matching the spec's flag names verbatim). Master `enabled` short-circuits the whole subsystem. All additive and default-on; absent block = all detectors run.",
+          "type": "object",
+          "additionalProperties": false,
+          "description": "IaC drift governance. Master `enabled` plus per-detector boolean toggles. Read by bin/iac-drift-scan.sh.",
+          "properties": {
+            "enabled":          { "type": "boolean", "default": true, "description": "Master switch. false short-circuits the iac-drift scan to an empty report." },
+            "unpinned_refs":    { "type": "boolean", "default": true, "description": "Toggle the unpinned-refs detector (moving module refs, unpinned providers/deps). Severity: high." },
+            "missing_lockfile": { "type": "boolean", "default": true, "description": "Toggle the missing-lockfile detector (.terraform.lock.hcl / Chart.lock / Pulumi plugins). Severity: medium." },
+            "secrets_in_vars":  { "type": "boolean", "default": true, "description": "Toggle the secrets-in-vars detector (committed credentials in var files). Severity: critical." },
+            "version_lag":      { "type": "boolean", "default": true, "description": "Toggle the version-lag detector (Helm appVersion behind the latest git tag). Severity: medium." },
+            "scanned_files": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional explicit scan set (repo-relative paths). Overrides the default multi-pattern find when present."
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "GuardList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name":     { "type": "string", "description": "Guard identifier (e.g. 'staged-files-exist'). Matches a script under bin/guards/<name>.sh." },
+          "severity": { "type": "string", "enum": ["advisory", "confirm", "critical"], "description": "Override the built-in severity. Profiles may promote advisory guards to confirm or critical." }
+        }
+      }
+    }
+  }
+}
